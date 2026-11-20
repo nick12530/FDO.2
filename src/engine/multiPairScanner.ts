@@ -157,6 +157,46 @@ export type PrecisionEntryCandidate = Pick<
   'setupLifecycleStage'
 >;
 
+export interface TargetPlan {
+  tp: number;
+  tp1: number;
+  tp2: number;
+  tp3: number;
+}
+
+export function buildTargetPlan(
+  direction: TradeDirection,
+  entry: number,
+  stop: number,
+  structuralLevels: number[],
+  priceIncrement: number,
+  digits: number,
+  fallbackMultiples: number[] = [1.2, 2, 3.2]
+): TargetPlan {
+  const sign = direction === 'BUY' ? 1 : -1;
+  const risk = Math.abs(entry - stop);
+  const levels = [...new Set(structuralLevels.filter((level) =>
+    Number.isFinite(level) && sign * (level - entry) > priceIncrement
+  ))].sort((a, b) => sign * (a - b));
+  const targets: number[] = [];
+
+  for (let index = 0; index < fallbackMultiples.length; index += 1) {
+    let target = levels[index] ?? entry + sign * risk * fallbackMultiples[index];
+    const previous = targets[index - 1];
+    if (previous !== undefined && sign * (target - previous) <= priceIncrement) {
+      target = previous + sign * Math.max(priceIncrement, risk * 0.25);
+    }
+    targets.push(Number(target.toFixed(digits)));
+  }
+
+  return {
+    tp: levels.length ? targets[0] : targets[1],
+    tp1: targets[0],
+    tp2: targets[1],
+    tp3: targets[2],
+  };
+}
+
 export function hasDirectionalMovement(
   candles: Candle[],
   atr: number,
@@ -183,8 +223,12 @@ function hasDirectionalExecutionCandle(candles: Candle[], atr: number, direction
     : current.close < current.open && current.close <= previous.low && current.close <= current.high - range * 0.7;
 }
 
-export function isPrecisionEntryReady(analysis: PrecisionEntryCandidate, now = Date.now()): boolean {
-  if (!isPrecisionSetupReady(analysis, now)) return false;
+export function isPrecisionEntryReady(
+  analysis: PrecisionEntryCandidate,
+  now = Date.now(),
+  minimumConfluenceScore = 88
+): boolean {
+  if (!isPrecisionSetupReady(analysis, now, minimumConfluenceScore)) return false;
   const executionPrice = getPrecisionEntryPrice(analysis);
   const tolerance = getPrecisionEntryTolerance(analysis);
   const optimalTradeEntry = analysis.signal?.optimalTradeEntry;
@@ -192,14 +236,18 @@ export function isPrecisionEntryReady(analysis: PrecisionEntryCandidate, now = D
   return Math.abs(executionPrice - optimalTradeEntry) <= tolerance;
 }
 
-export function isPrecisionSetupReady(analysis: PrecisionEntryCandidate, now = Date.now()): boolean {
+export function isPrecisionSetupReady(
+  analysis: PrecisionEntryCandidate,
+  now = Date.now(),
+  minimumConfluenceScore = 88
+): boolean {
   const signal = analysis.signal;
   if (
     !signal ||
     analysis.status !== 'READY' ||
     !analysis.spreadAcceptable ||
-    analysis.confluenceScore < 88 ||
-    signal.sniperGrade !== 'A+' ||
+    analysis.confluenceScore < minimumConfluenceScore ||
+    (minimumConfluenceScore >= 88 && signal.sniperGrade !== 'A+') ||
     !signal.isSniper ||
     (analysis.spreadAdjustedRiskRewardRatio ?? analysis.riskRewardRatio) < getInstrumentConfig(analysis.symbol).minRR ||
     !analysis.expiryTimestamp ||
@@ -216,14 +264,15 @@ export function isPrecisionSetupReady(analysis: PrecisionEntryCandidate, now = D
 export function isPrecisionExecutionReady(
   analysis: PrecisionEntryCandidate,
   mode: 'MARKET' | 'PULLBACK_LIMIT' = 'MARKET',
-  now = Date.now()
+  now = Date.now(),
+  minimumConfluenceScore = 88
 ): boolean {
-  if (isPrecisionEntryReady(analysis, now)) return true;
+  if (isPrecisionEntryReady(analysis, now, minimumConfluenceScore)) return true;
   const signal = analysis.signal;
   if (
     !signal ||
     (signal.executionMode !== 'PULLBACK_LIMIT' && mode !== 'PULLBACK_LIMIT') ||
-    !isPrecisionSetupReady(analysis, now)
+    !isPrecisionSetupReady(analysis, now, minimumConfluenceScore)
   ) {
     return false;
   }
@@ -937,78 +986,110 @@ export function analyzeInstrument(
     scoreMomentum + scoreSession + scoreSpread + scoreCandle + scoreVolume + scoreMacro;
   const confluenceScore = normalizeRawConfluenceScore(rawConfluenceScore, SCANNER_RAW_SCORE_MAX);
 
+  const dirMatchObs = executionObs.filter((ob) => tentativeBias === 'BUY' ? ob.bullish : !ob.bullish);
+  const dirMatchFvgs = executionFvgs.filter((fvg) => tentativeBias === 'BUY' ? fvg.bullish : !fvg.bullish);
+  const nearestPoi = [...matchedFvgs, ...matchedObs, ...dirMatchFvgs, ...dirMatchObs]
+    .filter((zone) => Math.abs((zone.top + zone.bottom) / 2 - price) <= execAtr * 2)
+    .sort((a, b) => {
+      const aRetested = price >= a.bottom && price <= a.top ? 0 : 1;
+      const bRetested = price >= b.bottom && price <= b.top ? 0 : 1;
+      if (aRetested !== bRetested) return aRetested - bRetested;
+      const aAge = executionCandles.length - 1 - a.born;
+      const bAge = executionCandles.length - 1 - b.born;
+      if (aAge !== bAge) return aAge - bAge;
+      const aMidpointBias = a.kind === 'FVG' ? 0 : 1;
+      const bMidpointBias = b.kind === 'FVG' ? 0 : 1;
+      return aMidpointBias - bMidpointBias;
+    })[0];
+  const poiAnchorPrice = nearestPoi
+    ? nearestPoi.kind === 'FVG'
+      ? (nearestPoi.bottom + nearestPoi.top) / 2
+      : nearestPoi.bullish
+        ? nearestPoi.top
+        : nearestPoi.bottom
+    : null;
+  const swingLow = executionStructure.lastSwingLow?.price || dr.low;
+  const swingHigh = executionStructure.lastSwingHigh?.price || dr.high;
+  const legSpan = Math.max(config.pipSize * 10, swingHigh - swingLow);
+  const oteBuy = swingLow + 0.382 * legSpan;
+  const oteSell = swingLow + 0.618 * legSpan;
+  const rawOptimalTradeEntry =
+    poiAnchorPrice !== null && Math.abs(price - poiAnchorPrice) <= atr * 2
+      ? poiAnchorPrice
+      : tentativeBias === 'BUY'
+        ? oteBuy
+        : oteSell;
+  const optimalTradeEntry = Number(rawOptimalTradeEntry.toFixed(config.digits));
+
   // 9. Stop Loss & Multi-Target Take Profit (Timeframe-calibrated for M1/M5 scalping & M15 swings)
   const slBuffer = execAtr * 0.3;
   const slFloorPips = signalTimeframe === 'M1' ? 4 : 5;
   const mult1 = signalTimeframe === 'M1' ? 1.2 : signalTimeframe === 'M5' ? 1.5 : 1.8;
   const mult2 = signalTimeframe === 'M1' ? 2.0 : signalTimeframe === 'M5' ? 2.5 : Math.max(3.2, config.minRR * 1.5);
   const mult3 = signalTimeframe === 'M1' ? 3.2 : signalTimeframe === 'M5' ? 4.0 : Math.max(5.5, config.minRR * 2.8);
-
+  const executionPrice = tentativeBias === 'BUY' ? liveAsk : tentativeBias === 'SELL' ? liveBid : price;
   let suggestedSL = price;
-  let suggestedTP = price;
-  let suggestedTP1 = price;
-  let suggestedTP2 = price;
-  let suggestedTP3 = price;
-
   if (tentativeBias === 'BUY') {
-    const anchorMs = executionStructure;
-    const swingLowPrice = anchorMs.lastSwingLow?.price || dr.low;
-    suggestedSL = Number(Math.min(price - execAtr * config.atrSlMultiplier, swingLowPrice - slBuffer).toFixed(config.digits));
-    const slDist = Math.max(config.pipSize * slFloorPips, price - suggestedSL);
-    const fallbackTargets = [
-      price + slDist * mult1,
-      price + slDist * mult2,
-      price + slDist * mult3,
-    ];
-    const structuralTargets = Array.from(new Set([
-      anchorMs.lastSwingHigh?.price,
-      ...executionLiquidity.equalHighs,
-      executionLiquidity.buySideLiquidity,
-      dr.high,
-    ].filter((target): target is number =>
-        typeof target === 'number' && Number.isFinite(target) && target > price + config.pointSize
-    ))).sort((a, b) => a - b);
-    suggestedTP1 = Number((structuralTargets[0] ?? fallbackTargets[0]).toFixed(config.digits));
-    suggestedTP2 = Number((structuralTargets[1] ?? structuralTargets[0] ?? fallbackTargets[1]).toFixed(config.digits));
-    suggestedTP3 = Number((structuralTargets[2] ?? structuralTargets[1] ?? fallbackTargets[2]).toFixed(config.digits));
-    suggestedTP = Number((structuralTargets[0] ?? fallbackTargets[1]).toFixed(config.digits));
+    const swingLowPrice = executionStructure.lastSwingLow?.price || dr.low;
+    suggestedSL = Number(Math.min(
+      price - execAtr * config.atrSlMultiplier,
+      swingLowPrice - slBuffer
+    ).toFixed(config.digits));
   } else if (tentativeBias === 'SELL') {
-    const anchorMs = executionStructure;
-    const swingHighPrice = anchorMs.lastSwingHigh?.price || dr.high;
-    suggestedSL = Number(Math.max(price + execAtr * config.atrSlMultiplier, swingHighPrice + slBuffer).toFixed(config.digits));
-    const slDist = Math.max(config.pipSize * slFloorPips, suggestedSL - price);
-    const fallbackTargets = [
-      price - slDist * mult1,
-      price - slDist * mult2,
-      price - slDist * mult3,
-    ];
-    const structuralTargets = Array.from(new Set([
-      anchorMs.lastSwingLow?.price,
-      ...executionLiquidity.equalLows,
-      executionLiquidity.sellSideLiquidity,
-      dr.low,
-    ].filter((target): target is number =>
-        typeof target === 'number' && Number.isFinite(target) && target < price - config.pointSize
-    ))).sort((a, b) => b - a);
-    suggestedTP1 = Number((structuralTargets[0] ?? fallbackTargets[0]).toFixed(config.digits));
-    suggestedTP2 = Number((structuralTargets[1] ?? structuralTargets[0] ?? fallbackTargets[1]).toFixed(config.digits));
-    suggestedTP3 = Number((structuralTargets[2] ?? structuralTargets[1] ?? fallbackTargets[2]).toFixed(config.digits));
-    suggestedTP = Number((structuralTargets[0] ?? fallbackTargets[1]).toFixed(config.digits));
+    const swingHighPrice = executionStructure.lastSwingHigh?.price || dr.high;
+    suggestedSL = Number(Math.max(
+      price + execAtr * config.atrSlMultiplier,
+      swingHighPrice + slBuffer
+    ).toFixed(config.digits));
   }
 
-  const executionPrice = tentativeBias === 'BUY' ? liveAsk : tentativeBias === 'SELL' ? liveBid : price;
-  const stopDistance = Math.abs(executionPrice - suggestedSL);
-  const targetDistance = Math.abs(suggestedTP - executionPrice);
-  const riskRewardRatio = Number((targetDistance / Math.max(0.00001, stopDistance)).toFixed(2));
-  const spreadCost = spreadPoints * config.pointSize;
-  const spreadAdjustedRiskRewardRatio = Number(
-    (Math.max(0, targetDistance - spreadCost) / Math.max(0.00001, stopDistance + spreadCost)).toFixed(2)
+  const marketEntryTolerance = Math.max(execAtr * 0.15, config.pipSize * 2);
+  const isMarketEntryConfirmed = Math.abs(executionPrice - optimalTradeEntry) <= marketEntryTolerance;
+  const hasBrokerValidPullback =
+    tentativeBias === 'BUY'
+      ? optimalTradeEntry < executionPrice && optimalTradeEntry > suggestedSL
+      : tentativeBias === 'SELL'
+        ? optimalTradeEntry > executionPrice && optimalTradeEntry < suggestedSL
+        : false;
+  const plannedEntryPrice = !isMarketEntryConfirmed && hasBrokerValidPullback
+    ? optimalTradeEntry
+    : executionPrice;
+  const stopDistance = Math.abs(plannedEntryPrice - suggestedSL);
+  const structuralTargets = tentativeBias === 'BUY'
+    ? [
+        executionStructure.lastSwingHigh?.price,
+        ...executionLiquidity.equalHighs,
+        executionLiquidity.buySideLiquidity,
+        dr.high,
+      ]
+    : [
+        executionStructure.lastSwingLow?.price,
+        ...executionLiquidity.equalLows,
+        executionLiquidity.sellSideLiquidity,
+        dr.low,
+      ];
+  const targetPlan = buildTargetPlan(
+    tentativeBias === 'BUY' ? 'BUY' : 'SELL',
+    plannedEntryPrice,
+    suggestedSL,
+    structuralTargets.filter((target): target is number => typeof target === 'number'),
+    config.pointSize,
+    config.digits,
+    [mult1, mult2, mult3]
   );
+  const suggestedTP = targetPlan.tp;
+  const suggestedTP1 = targetPlan.tp1;
+  const suggestedTP2 = targetPlan.tp2;
+  const suggestedTP3 = targetPlan.tp3;
+  const targetDistance = Math.abs(suggestedTP - plannedEntryPrice);
+  const riskRewardRatio = Number((targetDistance / Math.max(0.00001, stopDistance)).toFixed(2));
+  // Entry uses ask for BUY and bid for SELL; spread is already represented in executable prices.
+  const spreadAdjustedRiskRewardRatio = riskRewardRatio;
   const slPips = Number((stopDistance / config.pipSize).toFixed(1));
-  const targetPips1 = Number((Math.abs(suggestedTP1 - executionPrice) / config.pipSize).toFixed(1));
-  const targetPips2 = Number((Math.abs(suggestedTP2 - executionPrice) / config.pipSize).toFixed(1));
-  const targetPips3 = Number((Math.abs(suggestedTP3 - executionPrice) / config.pipSize).toFixed(1));
-  const targetPips = targetPips2;
+  const targetPips1 = Number((Math.abs(suggestedTP1 - plannedEntryPrice) / config.pipSize).toFixed(1));
+  const targetPips2 = Number((Math.abs(suggestedTP2 - plannedEntryPrice) / config.pipSize).toFixed(1));
+  const targetPips3 = Number((Math.abs(suggestedTP3 - plannedEntryPrice) / config.pipSize).toFixed(1));
+  const targetPips = Number((targetDistance / config.pipSize).toFixed(1));
 
   // 10. Position sizing & Correlation checks
   const sizingResult = context.skipAccountSizing
@@ -1081,52 +1162,8 @@ export function analyzeInstrument(
   const sniperQualityIndex = confluenceScore;
   const sniperGrade: 'A+' | 'A' | 'B' = confluenceScore >= 88 ? 'A+' : confluenceScore >= 75 ? 'A' : 'B';
 
-  // Anchor Optimal Trade Entry to nearest matching FVG 50% CE or OB proximal edge when within 2 ATR
-  const dirMatchObs = executionObs.filter((ob) => tentativeBias === 'BUY' ? ob.bullish : !ob.bullish);
-  const dirMatchFvgs = executionFvgs.filter((fvg) => tentativeBias === 'BUY' ? fvg.bullish : !fvg.bullish);
-  const nearestPoi = [...matchedFvgs, ...matchedObs, ...dirMatchFvgs, ...dirMatchObs]
-    .filter((zone) => Math.abs((zone.top + zone.bottom) / 2 - price) <= execAtr * 2)
-    .sort((a, b) => {
-      const aRetested = price >= a.bottom && price <= a.top ? 0 : 1;
-      const bRetested = price >= b.bottom && price <= b.top ? 0 : 1;
-      if (aRetested !== bRetested) return aRetested - bRetested;
-      const aAge = executionCandles.length - 1 - a.born;
-      const bAge = executionCandles.length - 1 - b.born;
-      if (aAge !== bAge) return aAge - bAge;
-      const aMidpointBias = a.kind === 'FVG' ? 0 : 1;
-      const bMidpointBias = b.kind === 'FVG' ? 0 : 1;
-      return aMidpointBias - bMidpointBias;
-    })[0];
-  const poiAnchorPrice = nearestPoi
-    ? nearestPoi.kind === 'FVG'
-      ? (nearestPoi.bottom + nearestPoi.top) / 2
-      : nearestPoi.bullish
-        ? nearestPoi.top
-        : nearestPoi.bottom
-    : null;
-
-  const swingLow = executionStructure.lastSwingLow?.price || dr.low;
-  const swingHigh = executionStructure.lastSwingHigh?.price || dr.high;
-  const legSpan = Math.max(config.pipSize * 10, swingHigh - swingLow);
-  const oteBuy = swingLow + 0.382 * legSpan;
-  const oteSell = swingLow + 0.618 * legSpan;
-  const rawOptimalTradeEntry =
-    poiAnchorPrice !== null && Math.abs(price - poiAnchorPrice) <= atr * 2
-      ? poiAnchorPrice
-      : tentativeBias === 'BUY'
-        ? oteBuy
-        : oteSell;
-  const optimalTradeEntry = Number(rawOptimalTradeEntry.toFixed(config.digits));
   const mitigationType = scoreLiquidity >= 10 ? 'Liquidity Pool Sweep (SFP)' : scoreObFvg >= 5 ? 'Order Block Mitigation' : 'Structural POI Retest';
   const entryDistance = Math.abs(executionPrice - optimalTradeEntry);
-  const marketEntryTolerance = Math.max(execAtr * 0.15, config.pipSize * 2);
-  const isMarketEntryConfirmed = entryDistance <= marketEntryTolerance;
-  const hasBrokerValidPullback =
-    tentativeBias === 'BUY'
-      ? optimalTradeEntry < executionPrice && optimalTradeEntry > suggestedSL
-      : tentativeBias === 'SELL'
-        ? optimalTradeEntry > executionPrice && optimalTradeEntry < suggestedSL
-        : false;
   if (status === 'READY' && setupLifecycleStage !== 'CONFIRMED') {
     status = 'WAITING';
     rejectionReason = `WAITING: SETUP_LIFECYCLE_${setupLifecycleStage}`;
@@ -1158,7 +1195,7 @@ export function analyzeInstrument(
       availableAt: signalGeneratedAt,
       sourceCandleOpenTime: signalCandleTime,
       sourceCandleCloseTime: signalCandleTime + signalCandleDurationMs,
-      entry: Number(executionPrice.toFixed(config.digits)),
+      entry: Number(plannedEntryPrice.toFixed(config.digits)),
       sl: suggestedSL,
       tp: suggestedTP,
       tp1: suggestedTP1,

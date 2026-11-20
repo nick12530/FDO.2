@@ -12,8 +12,26 @@ const TIMEFRAME_MS: Record<Signal['timeframe'], number> = {
 };
 const MIN_RESOLVED_SAMPLES = 20;
 const MIN_OUT_OF_SAMPLE_RESOLVED_SAMPLES = 5;
-export const HISTORICAL_REPLAY_POLICY_VERSION = 2;
+export const HISTORICAL_REPLAY_POLICY_VERSION = 3;
 const MAX_CONTIGUOUS_TICK_GAP_MS = 60_000;
+
+export type ReplayExitPolicy =
+  | 'CURRENT_BASELINE'
+  | 'FIXED_STRUCTURAL_TP'
+  | 'PARTIAL_TRAILING'
+  | 'STRUCTURE_TRAILING';
+
+const REPLAY_EXIT_POLICIES: ReplayExitPolicy[] = [
+  'CURRENT_BASELINE',
+  'FIXED_STRUCTURAL_TP',
+  'PARTIAL_TRAILING',
+  'STRUCTURE_TRAILING',
+];
+
+export interface ReplayStructureTrailEvent {
+  confirmedAt: number;
+  stopPrice: number;
+}
 
 export interface ReplayTickCoverage {
   tickCount: number;
@@ -26,12 +44,14 @@ export interface ReplayTickCoverage {
 export interface ReplayCandidate extends Signal {
   id: string;
   symbol: SupportedSymbol;
+  structureTrailEvents?: ReplayStructureTrailEvent[];
 }
 
 export interface SmcReplayDiscovery {
   candidates: ReplayCandidate[];
   rejectedForUnavailableNews: number;
   otherRejected: number;
+  rejectionReasons: Record<string, number>;
   unavailableReason?: string;
 }
 
@@ -56,6 +76,7 @@ export interface ReplayFill {
   grossR: number | null;
   mfeR: number | null;
   maeR: number | null;
+  exitPolicy: ReplayExitPolicy;
 }
 
 export interface ReplayMetrics {
@@ -78,6 +99,8 @@ export interface ReplayMetrics {
   netMaxDrawdownR: number | null;
   averageMfeR: number | null;
   averageMaeR: number | null;
+  averageWinnerR: number | null;
+  averageLoserR: number | null;
   transactionCostsKnown: boolean;
 }
 
@@ -91,6 +114,14 @@ export interface HistoricalReplayResult {
     training: ReplayMetrics;
     testing: ReplayMetrics;
   };
+  exitPolicyComparison: Record<ReplayExitPolicy, {
+    fills: ReplayFill[];
+    metrics: ReplayMetrics;
+    outOfSample: {
+      training: ReplayMetrics;
+      testing: ReplayMetrics;
+    };
+  }>;
   groups: {
     symbol: Record<string, ReplayMetrics>;
     session: Record<string, ReplayMetrics>;
@@ -112,6 +143,49 @@ function toCandle(candle: HistoricalCandle): Candle {
     close: candle.close,
     volume: candle.tickVolume,
   };
+}
+
+function buildStructureTrailEvents(
+  signal: ReplayCandidate,
+  candles: HistoricalCandle[]
+): ReplayStructureTrailEvent[] {
+  const events: ReplayStructureTrailEvent[] = [];
+  for (let index = 2; index < candles.length - 2; index += 1) {
+    const pivot = candles[index];
+    const confirmation = candles[index + 2];
+    const confirmedAt = confirmation.closeTime * 1000;
+    if (confirmedAt <= signal.sourceCandleCloseTime) continue;
+
+    const before = candles.slice(index - 2, index);
+    const after = candles.slice(index + 1, index + 3);
+    const isSwing = signal.direction === 'BUY'
+      ? before.every((bar) => pivot.low <= bar.low) && after.every((bar) => pivot.low <= bar.low)
+      : before.every((bar) => pivot.high >= bar.high) && after.every((bar) => pivot.high >= bar.high);
+    if (!isSwing) continue;
+
+    const stopPrice = signal.direction === 'BUY'
+      ? pivot.low - signal.atr * 0.25
+      : pivot.high + signal.atr * 0.25;
+    if (
+      !Number.isFinite(stopPrice) ||
+      (signal.direction === 'BUY' ? stopPrice <= signal.entry : stopPrice >= signal.entry)
+    ) continue;
+    events.push({ confirmedAt, stopPrice });
+  }
+  return events.sort((a, b) => a.confirmedAt - b.confirmedAt);
+}
+
+function attachStructureTrailEvents(
+  candidates: ReplayCandidate[],
+  candlesByTimeframe: Record<'M1' | 'M5' | 'M15', HistoricalCandle[]>
+): ReplayCandidate[] {
+  return candidates.map((candidate) => ({
+    ...candidate,
+    structureTrailEvents: buildStructureTrailEvents(
+      candidate,
+      candlesByTimeframe[candidate.timeframe]
+    ),
+  }));
 }
 
 export function discoverTechnicalReplaySignals(
@@ -182,8 +256,11 @@ export function discoverTechnicalReplaySignals(
       }
     }
   }
-  return Array.from(candidates.values()).sort(
-    (a, b) => Date.parse(a.availableAt) - Date.parse(b.availableAt)
+  return attachStructureTrailEvents(
+    Array.from(candidates.values()).sort(
+      (a, b) => Date.parse(a.availableAt) - Date.parse(b.availableAt)
+    ),
+    market
   );
 }
 
@@ -201,6 +278,7 @@ export function discoverSmcReplaySignals(
       candidates: [],
       rejectedForUnavailableNews: 0,
       otherRejected: 0,
+      rejectionReasons: {},
       unavailableReason: 'Historical SMC, liquidity-reversal, and news-dependent signals are unavailable because archived historical news was not supplied.',
     };
   }
@@ -218,6 +296,12 @@ export function discoverSmcReplaySignals(
   let tickCursor = 0;
   let rejectedForUnavailableNews = 0;
   let otherRejected = 0;
+  const rejectionReasons: Record<string, number> = {};
+  const recordRejection = (timeframe: Signal['timeframe'], score: number, reason: string) => {
+    const lower = Math.floor(score / 10) * 10;
+    const key = `${timeframe} ${lower}-${lower + 9}: ${reason}`;
+    rejectionReasons[key] = (rejectionReasons[key] ?? 0) + 1;
+  };
   for (const bar of frames.M1) {
     const decisionTime = bar.time * 1000 + TIMEFRAME_MS.M1;
     for (const timeframe of ['M1', 'M5', 'M15', 'H1'] as const) {
@@ -256,16 +340,35 @@ export function discoverSmcReplaySignals(
       }
     );
     for (const analysis of analyses) {
-      if (!analysis.signal) continue;
       if (analysis.newsStatus === 'NEWS FILTER: DATA UNAVAILABLE') {
         rejectedForUnavailableNews += 1;
+        recordRejection(
+          analysis.executionTimeframe ?? 'M5',
+          analysis.confluenceScore,
+          'HISTORICAL_NEWS_UNAVAILABLE'
+        );
+        continue;
+      }
+      if (!analysis.signal) {
+        otherRejected += 1;
+        recordRejection(
+          analysis.executionTimeframe ?? 'M5',
+          analysis.confluenceScore,
+          analysis.rejectionReason?.split(' (')[0] || 'NO_ACTIONABLE_SIGNAL'
+        );
         continue;
       }
       if (
         analysis.status !== 'READY' ||
-        !isPrecisionExecutionReady(analysis, 'PULLBACK_LIMIT', quote.timeMs)
+        !isPrecisionExecutionReady(analysis, 'PULLBACK_LIMIT', quote.timeMs, 70)
       ) {
         otherRejected += 1;
+        const reason = analysis.status !== 'READY'
+          ? analysis.rejectionReason?.split(' (')[0] || `STATUS_${analysis.status}`
+          : analysis.confluenceScore < 70
+            ? 'BELOW_RESEARCH_MIN_SCORE_70'
+            : 'PRECISION_ENTRY_NOT_CONFIRMED';
+        recordRejection(analysis.executionTimeframe ?? 'M5', analysis.confluenceScore, reason);
         continue;
       }
       const id = [
@@ -279,11 +382,15 @@ export function discoverSmcReplaySignals(
     }
   }
   return {
-    candidates: Array.from(unique.values()).sort(
-      (a, b) => Date.parse(a.availableAt) - Date.parse(b.availableAt)
+    candidates: attachStructureTrailEvents(
+      Array.from(unique.values()).sort(
+        (a, b) => Date.parse(a.availableAt) - Date.parse(b.availableAt)
+      ),
+      market
     ),
     rejectedForUnavailableNews,
     otherRejected,
+    rejectionReasons,
   };
 }
 
@@ -316,7 +423,8 @@ function lowerBoundTick(ticks: HistoricalTick[], timeMs: number): number {
 
 function replayOne(
   signal: ReplayCandidate,
-  ticks: HistoricalTick[]
+  ticks: HistoricalTick[],
+  exitPolicy: ReplayExitPolicy = 'CURRENT_BASELINE'
 ): ReplayFill {
   const discoveredAt = discoveryTime(signal);
   const expiry = signal.expiryTimestamp ?? discoveredAt + TIMEFRAME_MS[signal.timeframe];
@@ -334,6 +442,7 @@ function replayOne(
     discoveredAt,
     submittedAt: discoveredAt,
     executionMode: signal.executionMode ?? 'MARKET',
+    exitPolicy,
   };
   if (
     !Number.isFinite(signal.entry) ||
@@ -383,10 +492,17 @@ function replayOne(
       outcome: 'UNRESOLVED', grossR: null, mfeR: null, maeR: null,
     };
   }
+  const runnerPolicy = exitPolicy === 'PARTIAL_TRAILING' || exitPolicy === 'STRUCTURE_TRAILING';
+  const runnerTarget = runnerPolicy ? signal.tp3 : undefined;
+  const targetPrice = runnerTarget !== undefined && (
+    signal.direction === 'BUY'
+      ? runnerTarget > entryPrice
+      : runnerTarget < entryPrice
+  ) ? runnerTarget : signal.tp;
   if (
     signal.direction === 'BUY'
-      ? !(signal.sl < entryPrice && entryPrice < signal.tp)
-      : !(signal.tp < entryPrice && entryPrice < signal.sl)
+      ? !(signal.sl < entryPrice && entryPrice < targetPrice)
+      : !(targetPrice < entryPrice && entryPrice < signal.sl)
   ) {
     return {
       ...base, entryAt, entryPrice, exitAt: null, exitPrice: null,
@@ -401,30 +517,110 @@ function replayOne(
       outcome: 'INVALID', grossR: null, mfeR: null, maeR: null,
     };
   }
+  let activeStop = signal.sl;
+  let remainingFraction = 1;
+  let realizedR = 0;
+  let partialTaken = false;
+  let beMoved = false;
+  let trailEventIndex = 0;
+  const usesManagement = exitPolicy !== 'FIXED_STRUCTURAL_TP';
+  const usesPartial = exitPolicy === 'CURRENT_BASELINE' || exitPolicy === 'PARTIAL_TRAILING';
+  const instrument = getInstrumentConfig(signal.symbol);
+  const entryTick = ticks[entryIndex];
+  const entrySpread = entryTick.ask! - entryTick.bid!;
+  const beOffset = Math.max(
+    instrument.pipSize * 2,
+    entrySpread + signal.atr * 0.15
+  );
+  const beStop = signal.direction === 'BUY'
+    ? entryPrice + beOffset
+    : entryPrice - beOffset;
   let mfe = 0;
   let mae = 0;
   const evaluateTick = (tick: HistoricalTick) => {
     const exitSide = signal.direction === 'BUY' ? tick.bid! : tick.ask!;
     const favorable = signal.direction === 'BUY' ? exitSide - entryPrice : entryPrice - exitSide;
     const stopHit = signal.direction === 'BUY'
-      ? tick.bid! <= signal.sl
-      : tick.ask! >= signal.sl;
+      ? tick.bid! <= activeStop
+      : tick.ask! >= activeStop;
     const targetHit = signal.direction === 'BUY'
-      ? tick.bid! >= signal.tp
-      : tick.ask! <= signal.tp;
+      ? tick.bid! >= targetPrice
+      : tick.ask! <= targetPrice;
     return { exitSide, stopHit, targetHit, favorableR: favorable / risk };
   };
-  const evaluateQuoteGroup = (group: HistoricalTick[]) => {
-    const observations = group.filter(isValidQuote).map(evaluateTick);
+  const evaluateQuoteGroup = (group: HistoricalTick[], timeMs: number) => {
+    const validQuotes = group.filter(isValidQuote);
+    const preliminary = validQuotes.map(evaluateTick);
+    const bestFavorableR = Math.max(0, ...preliminary.map((item) => item.favorableR));
+    const preUpdateStopHit = preliminary.some((item) => item.stopHit);
+    const preUpdateTargetHit = preliminary.some((item) => item.targetHit);
+    const breakEvenUpdateDue =
+      usesManagement &&
+      !beMoved &&
+      bestFavorableR >= (signal.timeframe === 'M1' ? 0.9 : 1);
+    const trailEvents = signal.structureTrailEvents ?? [];
+    const structureUpdateDue =
+      usesManagement &&
+      bestFavorableR >= 1.8 &&
+      trailEventIndex < trailEvents.length &&
+      trailEvents[trailEventIndex].confirmedAt <= timeMs;
+    if (
+      preUpdateStopHit &&
+      (preUpdateTargetHit || breakEvenUpdateDue || structureUpdateDue)
+    ) {
+      return { ambiguous: true as const };
+    }
+    if (breakEvenUpdateDue) {
+      activeStop = signal.direction === 'BUY'
+        ? Math.max(activeStop, beStop)
+        : Math.min(activeStop, beStop);
+      beMoved = true;
+    }
+    if (usesManagement && bestFavorableR >= 1.8) {
+      while (
+        trailEventIndex < trailEvents.length &&
+        trailEvents[trailEventIndex].confirmedAt <= timeMs
+      ) {
+        const proposedStop = trailEvents[trailEventIndex].stopPrice;
+        if (signal.direction === 'BUY' && proposedStop > activeStop) activeStop = proposedStop;
+        if (signal.direction === 'SELL' && proposedStop < activeStop) activeStop = proposedStop;
+        trailEventIndex += 1;
+      }
+    }
+    const observations = validQuotes.map(evaluateTick);
     const stopResults = observations.filter((item) => item.stopHit);
     const targetResults = observations.filter((item) => item.targetHit);
     if (stopResults.length > 0 && targetResults.length > 0) return { ambiguous: true as const };
 
+    const partialLevel = signal.direction === 'BUY'
+      ? entryPrice + risk * 1.35
+      : entryPrice - risk * 1.35;
+    const targetPrecedesPartial = signal.direction === 'BUY'
+      ? targetPrice <= partialLevel
+      : targetPrice >= partialLevel;
+    const partialReached =
+      usesPartial &&
+      !targetPrecedesPartial &&
+      !partialTaken &&
+      targetResults.length === 0 &&
+      bestFavorableR >= 1.35;
+    if (partialReached && stopResults.length > 0) {
+      return { ambiguous: true as const };
+    }
     const firstExitIndex = observations.findIndex((item) => item.stopHit || item.targetHit);
     const measured = firstExitIndex >= 0 ? observations.slice(0, firstExitIndex + 1) : observations;
     for (const item of measured) {
       mfe = Math.max(mfe, item.favorableR);
       mae = Math.max(mae, -item.favorableR);
+    }
+    if (partialReached) {
+      realizedR += 0.5 * 1.35;
+      remainingFraction = 0.5;
+      partialTaken = true;
+      activeStop = signal.direction === 'BUY'
+        ? Math.max(activeStop, beStop)
+        : Math.min(activeStop, beStop);
+      beMoved = true;
     }
     return {
       ambiguous: false as const,
@@ -433,7 +629,7 @@ function replayOne(
   };
   let entryGroupEnd = entryIndex + 1;
   while (entryGroupEnd < ticks.length && ticks[entryGroupEnd].timeMs === entryAt) entryGroupEnd += 1;
-  const entryGroupResult = evaluateQuoteGroup(ticks.slice(entryIndex, entryGroupEnd));
+  const entryGroupResult = evaluateQuoteGroup(ticks.slice(entryIndex, entryGroupEnd), entryAt);
   if (entryGroupResult.ambiguous) {
     return {
       ...base, entryAt, entryPrice, exitAt: null, exitPrice: null,
@@ -442,9 +638,10 @@ function replayOne(
   }
   if (entryGroupResult.exit) {
     const { exitSide, stopHit } = entryGroupResult.exit;
-    const grossR = (signal.direction === 'BUY'
+    const exitR = (signal.direction === 'BUY'
       ? exitSide - entryPrice
       : entryPrice - exitSide) / risk;
+    const grossR = realizedR + remainingFraction * exitR;
     return {
       ...base,
       entryAt,
@@ -467,7 +664,7 @@ function replayOne(
     }
     let groupEnd = index + 1;
     while (groupEnd < ticks.length && ticks[groupEnd].timeMs === timeMs) groupEnd += 1;
-    const groupResult = evaluateQuoteGroup(ticks.slice(index, groupEnd));
+    const groupResult = evaluateQuoteGroup(ticks.slice(index, groupEnd), timeMs);
     if (groupResult.ambiguous) {
       return {
         ...base, entryAt, entryPrice, exitAt: null, exitPrice: null,
@@ -477,9 +674,10 @@ function replayOne(
     if (groupResult.exit) {
       const { exitSide, stopHit } = groupResult.exit;
       const exitPrice = exitSide;
-      const grossR = (signal.direction === 'BUY'
+      const exitR = (signal.direction === 'BUY'
         ? exitPrice - entryPrice
         : entryPrice - exitPrice) / risk;
+      const grossR = realizedR + remainingFraction * exitR;
       return {
         ...base,
         entryAt,
@@ -523,6 +721,8 @@ export function summarizeReplayFills(
   const grossLosses = Math.abs(grossValues.filter((value) => value < 0).reduce((sum, value) => sum + value, 0));
   const netWins = netValues.filter((value) => value > 0).reduce((sum, value) => sum + value, 0);
   const netLosses = Math.abs(netValues.filter((value) => value < 0).reduce((sum, value) => sum + value, 0));
+  const winnersR = grossValues.filter((value) => value > 0);
+  const losersR = grossValues.filter((value) => value < 0);
   let grossPeak = 0;
   let grossEquity = 0;
   let grossDrawdown = 0;
@@ -563,6 +763,8 @@ export function summarizeReplayFills(
     netMaxDrawdownR: costsKnown && netValues.length ? netDrawdown : null,
     averageMfeR: mean(resolved.map((fill) => fill.mfeR).filter((value): value is number => value !== null)),
     averageMaeR: mean(resolved.map((fill) => fill.maeR).filter((value): value is number => value !== null)),
+    averageWinnerR: mean(winnersR),
+    averageLoserR: mean(losersR),
     transactionCostsKnown: costsKnown,
   };
 }
@@ -596,7 +798,16 @@ export function replayHistoricalSignals(
   } = {}
 ): HistoricalReplayResult {
   const ticks = historicalTicks.filter(isValidQuote).sort((a, b) => a.timeMs - b.timeMs);
-  const fills = signals.map((signal) => replayOne(signal, ticks));
+  const sortedSignals = [...signals].sort(
+    (a, b) => discoveryTime(a) - discoveryTime(b)
+  );
+  const policyFills = Object.fromEntries(
+    REPLAY_EXIT_POLICIES.map((policy) => [
+      policy,
+      sortedSignals.map((signal) => replayOne(signal, ticks, policy)),
+    ])
+  ) as Record<ReplayExitPolicy, ReplayFill[]>;
+  const fills = policyFills.CURRENT_BASELINE;
   let largestGapMs: number | null = null;
   let gapsOver60Seconds = 0;
   for (let index = 1; index < ticks.length; index += 1) {
@@ -604,23 +815,39 @@ export function replayHistoricalSignals(
     largestGapMs = largestGapMs === null ? gap : Math.max(largestGapMs, gap);
     if (gap > MAX_CONTIGUOUS_TICK_GAP_MS) gapsOver60Seconds += 1;
   }
-  const sortedSignals = [...signals].sort(
-    (a, b) => discoveryTime(a) - discoveryTime(b)
-  );
   const cutoffIndex = Math.floor(sortedSignals.length * 0.7);
-  const cutoffTime = sortedSignals[cutoffIndex]?.availableAt
-    ? Date.parse(sortedSignals[cutoffIndex].availableAt)
+  const cutoffTime = sortedSignals[cutoffIndex]
+    ? discoveryTime(sortedSignals[cutoffIndex])
     : null;
-  const training = fills.filter(
-    (fill) =>
-      cutoffTime !== null &&
-      fill.discoveredAt < cutoffTime &&
-      (fill.exitAt === null || fill.exitAt < cutoffTime)
-  );
+  const inTrainingWindow = (fill: ReplayFill) =>
+    cutoffTime !== null &&
+    fill.discoveredAt < cutoffTime &&
+    (fill.entryAt === null || (fill.exitAt !== null && fill.exitAt < cutoffTime));
+  const training = fills.filter(inTrainingWindow);
   const testing = fills.filter((fill) => cutoffTime !== null && fill.discoveredAt >= cutoffTime);
   const roundTurnCostR = options.roundTurnCostR ?? null;
   const slippageR = options.slippageR ?? null;
   const resultMetrics = summarizeReplayFills(fills, roundTurnCostR, slippageR);
+  const exitPolicyComparison = Object.fromEntries(
+    REPLAY_EXIT_POLICIES.map((policy) => {
+      const policyRows = policyFills[policy];
+      const policyTraining = policyRows.filter(inTrainingWindow);
+      const policyTesting = policyRows.filter(
+        (fill) => cutoffTime !== null && fill.discoveredAt >= cutoffTime
+      );
+      return [
+        policy,
+        {
+          fills: policyRows,
+          metrics: summarizeReplayFills(policyRows, roundTurnCostR, slippageR),
+          outOfSample: {
+            training: summarizeReplayFills(policyTraining, roundTurnCostR, slippageR),
+            testing: summarizeReplayFills(policyTesting, roundTurnCostR, slippageR),
+          },
+        },
+      ];
+    })
+  ) as HistoricalReplayResult['exitPolicyComparison'];
   const unavailableReasons: string[] = [];
   if (!options.ticksAvailable || ticks.length === 0) {
     unavailableReasons.push('Genuine bid/ask tick history is unavailable; fills and performance are not established.');
@@ -655,6 +882,7 @@ export function replayHistoricalSignals(
       training: summarizeReplayFills(training, roundTurnCostR, slippageR),
       testing: summarizeReplayFills(testing, roundTurnCostR, slippageR),
     },
+    exitPolicyComparison,
     groups: {
       symbol: groupMetrics(fills, (fill) => fill.symbol, roundTurnCostR, slippageR),
       session: groupMetrics(fills, (fill) => fill.session, roundTurnCostR, slippageR),

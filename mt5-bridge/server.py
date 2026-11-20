@@ -1339,6 +1339,80 @@ def validate_execution_quote(
     return (ask if direction == "BUY" else bid), spread_points
 
 
+def align_and_validate_order_levels(
+    direction: str,
+    entry_price: float,
+    stop_loss: float,
+    take_profit: float,
+    tick_size: float,
+    digits: int,
+    minimum_distance: float,
+) -> tuple[float, float]:
+    if (
+        not all(math.isfinite(value) for value in (
+            entry_price, stop_loss, take_profit, tick_size, minimum_distance
+        ))
+        or entry_price <= 0
+        or tick_size <= 0
+        or minimum_distance < 0
+    ):
+        raise HTTPException(status_code=400, detail="Order prices or broker price constraints are invalid.")
+
+    aligned_sl = round(round(stop_loss / tick_size) * tick_size, digits)
+    aligned_tp = round(round(take_profit / tick_size) * tick_size, digits)
+    if direction == "BUY":
+        valid_sl = aligned_sl < entry_price and entry_price - aligned_sl >= minimum_distance
+        valid_tp = aligned_tp > entry_price and aligned_tp - entry_price >= minimum_distance
+    else:
+        valid_sl = aligned_sl > entry_price and aligned_sl - entry_price >= minimum_distance
+        valid_tp = aligned_tp < entry_price and entry_price - aligned_tp >= minimum_distance
+
+    if not valid_sl:
+        raise HTTPException(
+            status_code=400,
+            detail="TRADE_REJECTED: requested stop loss is invalid or inside the broker minimum distance.",
+        )
+    if not valid_tp:
+        raise HTTPException(
+            status_code=400,
+            detail="TRADE_REJECTED: requested take profit is invalid or inside the broker minimum distance.",
+        )
+    return aligned_sl, aligned_tp
+
+
+def align_and_validate_limit_price(
+    direction: str,
+    current_price: float,
+    limit_price: float,
+    tick_size: float,
+    digits: int,
+    minimum_distance: float,
+) -> float:
+    if (
+        not all(math.isfinite(value) for value in (
+            current_price, limit_price, tick_size, minimum_distance
+        ))
+        or current_price <= 0
+        or limit_price <= 0
+        or tick_size <= 0
+        or minimum_distance < 0
+    ):
+        raise HTTPException(status_code=400, detail="Limit price or broker price constraints are invalid.")
+
+    aligned_price = round(round(limit_price / tick_size) * tick_size, digits)
+    valid = (
+        aligned_price <= current_price - minimum_distance
+        if direction == "BUY"
+        else aligned_price >= current_price + minimum_distance
+    )
+    if not valid:
+        raise HTTPException(
+            status_code=400,
+            detail="TRADE_REJECTED: limit price is not broker-valid; no market order was substituted.",
+        )
+    return aligned_price
+
+
 @app.post("/api/trade")
 @idempotent_order
 def place_trade(payload: TradeRequest, request: Request) -> dict:
@@ -1567,16 +1641,19 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
     point_val = float(getattr(info, "point", tick_size)) or tick_size
     min_stop_distance = max(float(symbol_spec.get("tradeStopsLevel", 0)) * point_val, tick_size * 5)
 
-    use_pending_limit = False
+    use_pending_limit = payload.orderType == "LIMIT"
     entry_reference_price = price
-    if payload.orderType == "LIMIT" and payload.limitPrice is not None and math.isfinite(payload.limitPrice):
-        rounded_limit = round(round(payload.limitPrice / tick_size) * tick_size, digits)
-        if payload.direction == "BUY" and rounded_limit < price - min_stop_distance:
-            use_pending_limit = True
-            entry_reference_price = rounded_limit
-        elif payload.direction == "SELL" and rounded_limit > price + min_stop_distance:
-            use_pending_limit = True
-            entry_reference_price = rounded_limit
+    if use_pending_limit:
+        if payload.limitPrice is None or not math.isfinite(payload.limitPrice):
+            raise HTTPException(status_code=400, detail="A finite limit price is required for a limit order.")
+        entry_reference_price = align_and_validate_limit_price(
+            payload.direction,
+            price,
+            payload.limitPrice,
+            tick_size,
+            digits,
+            min_stop_distance,
+        )
 
     if use_pending_limit:
         order_type = (
@@ -1587,22 +1664,15 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
     else:
         order_type = mt5.ORDER_TYPE_BUY if payload.direction == "BUY" else mt5.ORDER_TYPE_SELL
 
-    # Auto-align SL and TP to valid tick sizes and broker limits instead of throwing 400 Bad Request
-    if payload.sl:
-        payload.sl = round(round(payload.sl / tick_size) * tick_size, digits)
-    if payload.tp:
-        payload.tp = round(round(payload.tp / tick_size) * tick_size, digits)
-
-    if payload.direction == "BUY":
-        if payload.sl >= entry_reference_price or abs(entry_reference_price - payload.sl) < min_stop_distance:
-            payload.sl = round(entry_reference_price - min_stop_distance * 2, digits)
-        if payload.tp <= entry_reference_price or abs(payload.tp - entry_reference_price) < min_stop_distance:
-            payload.tp = round(entry_reference_price + min_stop_distance * 4, digits)
-    else:
-        if payload.sl <= entry_reference_price or abs(payload.sl - entry_reference_price) < min_stop_distance:
-            payload.sl = round(entry_reference_price + min_stop_distance * 2, digits)
-        if payload.tp >= entry_reference_price or abs(entry_reference_price - payload.tp) < min_stop_distance:
-            payload.tp = round(entry_reference_price - min_stop_distance * 4, digits)
+    payload.sl, payload.tp = align_and_validate_order_levels(
+        payload.direction,
+        entry_reference_price,
+        payload.sl,
+        payload.tp,
+        tick_size,
+        digits,
+        min_stop_distance,
+    )
 
     # Target SL and TP requested
     desired_sl = float(payload.sl or 0.0)

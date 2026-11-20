@@ -6,6 +6,7 @@ import {
   rankOpportunities,
   checkCorrelationExposure,
   calculateSmallAccountPositionSize,
+  buildTargetPlan,
   findLiquidityLevels,
   hasDirectionalMovement,
   isPrecisionEntryImminent,
@@ -18,6 +19,22 @@ import { getGlobalSessionStatus, evaluateNewsRisk, isSessionPreferredForPair } f
 import { tradingEngine } from './tradingEngine';
 
 describe('Multi-Pair Market Scanner & Instrument System', () => {
+  it('keeps target ladders directional and aligns the fixed target with the displayed distances', () => {
+    const buyStructural = buildTargetPlan('BUY', 100, 99, [105, 102, 102], 0.01, 2);
+    expect(buyStructural).toEqual({ tp: 102, tp1: 102, tp2: 105, tp3: 105.25 });
+
+    const buyFallback = buildTargetPlan('BUY', 100, 99, [], 0.01, 2, [1.2, 2, 3.2]);
+    expect(buyFallback).toEqual({ tp: 102, tp1: 101.2, tp2: 102, tp3: 103.2 });
+
+    const sellStructural = buildTargetPlan('SELL', 100, 101, [95, 98, 98], 0.01, 2);
+    expect(sellStructural).toEqual({ tp: 98, tp1: 98, tp2: 95, tp3: 94.75 });
+
+    for (const [direction, plan] of [['BUY', buyStructural], ['SELL', sellStructural]] as const) {
+      expect(Math.abs(plan.tp - 100)).toBeLessThanOrEqual(Math.abs(plan.tp1 - 100));
+      expect(direction === 'BUY' ? plan.tp1 < plan.tp2 && plan.tp2 < plan.tp3 : plan.tp1 > plan.tp2 && plan.tp2 > plan.tp3).toBe(true);
+    }
+  });
+
   it('requires direction-aligned movement to qualify a scanner signal', () => {
     const candles = [100, 100.01, 100.02, 100.03].map((close, index) => ({
       time: index,
@@ -79,6 +96,13 @@ describe('Multi-Pair Market Scanner & Instrument System', () => {
 
     expect(isPrecisionEntryReady(candidate, 60_000)).toBe(true);
     expect(isPrecisionExecutionReady(candidate, 'MARKET', 60_000)).toBe(true);
+    const belowAPlus = {
+      ...candidate,
+      confluenceScore: 80,
+      signal: { ...candidate.signal, score: 80, sniperGrade: 'A' as const },
+    };
+    expect(isPrecisionEntryReady(belowAPlus, 60_000)).toBe(false);
+    expect(isPrecisionExecutionReady(belowAPlus, 'MARKET', 60_000, 70)).toBe(true);
     const boundaryCandidates = [99, 100, 101].map((rawScore) => ({
       ...candidate,
       confluenceScore: normalizeRawConfluenceScore(rawScore, SCANNER_RAW_SCORE_MAX),

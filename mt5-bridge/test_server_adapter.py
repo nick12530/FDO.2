@@ -194,6 +194,44 @@ class TestServerTestDependencies(unittest.TestCase):
             )
         self.assertEqual(error.exception.status_code, 423)
 
+    def test_limit_price_never_falls_back_to_market_when_not_broker_valid(self):
+        buy_limit = self.server.align_and_validate_limit_price(
+            "BUY", 1.1002, 1.0990, 0.0001, 4, 0.0005
+        )
+        sell_limit = self.server.align_and_validate_limit_price(
+            "SELL", 1.1000, 1.1010, 0.0001, 4, 0.0005
+        )
+        self.assertEqual((buy_limit, sell_limit), (1.099, 1.101))
+
+        for direction, limit in (("BUY", 1.1000), ("SELL", 1.1004)):
+            with self.subTest(direction=direction), self.assertRaises(self.server.HTTPException) as error:
+                self.server.align_and_validate_limit_price(
+                    direction, 1.1002, limit, 0.0001, 4, 0.0005
+                )
+            self.assertEqual(error.exception.status_code, 400)
+            self.assertIn("no market order was substituted", error.exception.detail)
+
+    def test_requested_stops_and_targets_are_validated_without_replacement(self):
+        self.assertEqual(
+            self.server.align_and_validate_order_levels(
+                "BUY", 1.1000, 1.0990, 1.1020, 0.0001, 4, 0.0005
+            ),
+            (1.099, 1.102),
+        )
+        self.assertEqual(
+            self.server.align_and_validate_order_levels(
+                "SELL", 1.1000, 1.1010, 1.0980, 0.0001, 4, 0.0005
+            ),
+            (1.101, 1.098),
+        )
+
+        with self.assertRaises(self.server.HTTPException) as error:
+            self.server.align_and_validate_order_levels(
+                "BUY", 1.1000, 1.0999, 1.1020, 0.0001, 4, 0.0005
+            )
+        self.assertEqual(error.exception.status_code, 400)
+        self.assertIn("stop loss", error.exception.detail)
+
     def test_research_candles_are_broker_sourced_and_only_include_closed_bars(self):
         adapter = FakeMT5Adapter()
         self.server.configure_mt5_adapter(adapter)

@@ -43,7 +43,7 @@ describe('HistoricalReplayPanel', () => {
     expect(bridgeMocks.getHistoricalCandles).toHaveBeenCalledTimes(4);
     expect(bridgeMocks.getHistoricalTicksChunked).toHaveBeenCalledTimes(1);
     expect(screen.getByText(/Genuine bid\/ask tick history is unavailable/)).toBeTruthy();
-    expect(screen.getByText(/Net expectancy \/ PF/)).toBeTruthy();
+    expect(screen.getAllByText(/Net expectancy \/ PF/)).toHaveLength(2);
   });
 
   it('rejects history responses that cross an account switch', async () => {

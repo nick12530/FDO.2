@@ -8,6 +8,7 @@ import {
   replayHistoricalSignals,
   type HistoricalReplayResult,
   type ReplayMetrics,
+  type ReplayExitPolicy,
 } from '../engine/historicalReplay';
 import { mt5Bridge, type HistoricalResearchResponse } from '../engine/mt5Bridge';
 import type { SymbolTradingSpec } from '../types/smc';
@@ -268,6 +269,7 @@ export const HistoricalReplayPanel: React.FC<HistoricalReplayPanelProps> = ({
             <Metric label="Gross win rate" value={metrics.winRate === null ? '—' : `${(metrics.winRate * 100).toFixed(1)}% (${metrics.wins}/${metrics.resolvedCount})`} />
             <Metric label="Gross max drawdown (R)" value={metrics.grossMaxDrawdownR === null ? '—' : `${metrics.grossMaxDrawdownR.toFixed(2)}R`} />
             <Metric label="Average MFE / MAE (R)" value={`${metrics.averageMfeR?.toFixed(2) ?? '—'} / ${metrics.averageMaeR?.toFixed(2) ?? '—'}`} />
+            <Metric label="Average winner / loser (R)" value={`${metrics.averageWinnerR?.toFixed(2) ?? '—'} / ${metrics.averageLoserR?.toFixed(2) ?? '—'}`} />
             <Metric
               label="Net expectancy / PF"
               value={!metrics.transactionCostsKnown || !performanceSufficient
@@ -290,6 +292,55 @@ export const HistoricalReplayPanel: React.FC<HistoricalReplayPanelProps> = ({
                 ? ` · Test gross expectancy: ${result.outOfSample.testing.grossExpectancyR.toFixed(2)}R`
                 : ' · Test result insufficient'}
             </p>
+          </div>
+
+          <div className="overflow-x-auto rounded-lg border border-slate-200 dark:border-[#2b3b59]">
+            <table className="w-full min-w-[700px] text-left">
+              <thead className="bg-slate-50 text-[10px] uppercase text-slate-500 dark:bg-[#101722] dark:text-slate-400">
+                <tr>
+                  <th className="p-2.5">Exit policy</th>
+                  <th className="p-2 text-right">Resolved</th>
+                  <th className="p-2 text-right">Net expectancy / PF</th>
+                  <th className="p-2.5 text-right">OOS net expectancy / PF</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100 dark:divide-[#2b3b59]">
+                {([
+                  ['CURRENT_BASELINE', 'Current baseline'],
+                  ['FIXED_STRUCTURAL_TP', 'Fixed structural TP'],
+                  ['PARTIAL_TRAILING', '50% partial + trailing remainder'],
+                  ['STRUCTURE_TRAILING', 'Structure trailing'],
+                ] as Array<[ReplayExitPolicy, string]>).map(([policy, label]) => {
+                  const comparison = result.exitPolicyComparison[policy];
+                  const policyMetrics = comparison.metrics;
+                  const testMetrics = comparison.outOfSample.testing;
+                  const formatNet = (row: ReplayMetrics, minimumSamples = 20) =>
+                    !row.transactionCostsKnown
+                      ? 'Costs unavailable'
+                      : row.resolvedCount < minimumSamples || row.netExpectancyR === null
+                        ? 'Insufficient samples'
+                        : `${row.netExpectancyR.toFixed(2)}R / ${
+                            row.netProfitFactor === null
+                              ? '—'
+                              : Number.isFinite(row.netProfitFactor)
+                                ? row.netProfitFactor.toFixed(2)
+                                : 'Unbounded'
+                          }`;
+                  return (
+                    <tr key={policy}>
+                      <td className="p-2.5 font-semibold">{label}</td>
+                      <td className="p-2 text-right font-mono">{policyMetrics.resolvedCount}</td>
+                      <td className="p-2 text-right font-mono">{formatNet(policyMetrics)}</td>
+                      <td className="p-2.5 text-right font-mono">
+                        {testMetrics.resolvedCount < 5
+                          ? 'Insufficient samples'
+                          : formatNet(testMetrics, 5)}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
           </div>
 
           <div className="overflow-x-auto rounded-lg border border-slate-200 dark:border-[#2b3b59]">

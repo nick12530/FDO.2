@@ -225,4 +225,55 @@ describe('historical tick replay', () => {
     expect(result.metrics.resolvedCount).toBe(0);
     expect(result.unavailableReasons[0]).toContain('Genuine bid/ask tick history is unavailable');
   });
+
+  it('compares the unchanged fixed-target baseline with partial and structure-trailing policies', () => {
+    const candidate = signal({
+      tp3: 1.104,
+      structureTrailEvents: [{ confirmedAt: 1_080_000, stopPrice: 1.102 }],
+    });
+    const result = replayHistoricalSignals(
+      [candidate],
+      [
+        tick(1_060_000, 1.1, 1.1002),
+        tick(1_070_000, 1.1019, 1.1021),
+        tick(1_080_000, 1.103, 1.1032),
+        tick(1_090_000, 1.1019, 1.1021),
+      ],
+      { ticksAvailable: true, roundTurnCostR: 0.05, slippageR: 0.02 }
+    );
+
+    expect(result.exitPolicyComparison.CURRENT_BASELINE.metrics.resolvedCount).toBe(1);
+    expect(result.exitPolicyComparison.FIXED_STRUCTURAL_TP.metrics.resolvedCount).toBe(1);
+    expect(result.exitPolicyComparison.PARTIAL_TRAILING.metrics.resolvedCount).toBe(1);
+    expect(result.exitPolicyComparison.STRUCTURE_TRAILING.metrics.resolvedCount).toBe(1);
+    expect(result.exitPolicyComparison.PARTIAL_TRAILING.metrics.grossExpectancyR).toBeCloseTo(1.38, 2);
+    expect(result.exitPolicyComparison.FIXED_STRUCTURAL_TP.metrics.grossExpectancyR).toBeCloseTo(2.33, 2);
+    expect(result.exitPolicyComparison.PARTIAL_TRAILING.metrics.averageWinnerR).toBeCloseTo(1.38, 2);
+    expect(result.exitPolicyComparison.PARTIAL_TRAILING.metrics.transactionCostsKnown).toBe(true);
+    expect(result.exitPolicyComparison.PARTIAL_TRAILING.outOfSample.testing.resolvedCount).toBe(1);
+  });
+
+  it('applies a swing trail only after its chronological confirmation time', () => {
+    const result = replayHistoricalSignals(
+      [signal({
+        tp3: 1.104,
+        structureTrailEvents: [{ confirmedAt: 1_090_000, stopPrice: 1.101 }],
+      })],
+      [
+        tick(1_060_000, 1.1, 1.1002),
+        tick(1_070_000, 1.1025, 1.1027),
+        tick(1_075_000, 1.1008, 1.1010),
+        tick(1_080_000, 1.103, 1.1032),
+        tick(1_080_000, 1.1008, 1.1010),
+        tick(1_090_000, 1.1008, 1.1010),
+      ],
+      { ticksAvailable: true }
+    );
+
+    const trail = result.exitPolicyComparison.STRUCTURE_TRAILING;
+    expect(trail.metrics.resolvedCount).toBe(1);
+    expect(trail.fills[0].exitAt).toBe(1_090_000);
+    expect(trail.fills[0].grossR).toBeCloseTo(0.5);
+    expect(trail.metrics.averageLoserR).toBeNull();
+  });
 });

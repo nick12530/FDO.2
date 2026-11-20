@@ -110,6 +110,18 @@ export interface RiskSizingInfo {
   safeVolume: number | null;
 }
 
+export type ExitManagementPolicy =
+  | 'CURRENT_BASELINE'
+  | 'FIXED_STRUCTURAL_TP'
+  | 'PARTIAL_TRAILING'
+  | 'STRUCTURE_TRAILING';
+
+export function getExitPolicyTakeProfit(signal: Signal, policy: ExitManagementPolicy): number {
+  return policy === 'PARTIAL_TRAILING' || policy === 'STRUCTURE_TRAILING'
+    ? signal.tp3 ?? signal.tp
+    : signal.tp;
+}
+
 function isTestRuntime(): boolean {
   return (
     typeof (globalThis as any).vi !== 'undefined' ||
@@ -320,6 +332,7 @@ export class TradingEngine {
   killSwitch: boolean = false;
   autoTrade: boolean = false;
   autoBeEnabled: boolean = true;
+  exitPolicy: ExitManagementPolicy = 'CURRENT_BASELINE';
   circuitBreakerEnabled: boolean = true;
   newsBlackout: boolean = false;
   bypassNewsBlackout: boolean = false;
@@ -682,6 +695,13 @@ export class TradingEngine {
     const symUpper = (snapshot.symbol || '').toUpperCase().trim();
     this.activeSymbol = getSupportedSymbol(symUpper) ?? 'XAUUSD';
     this.brokerAccountMode = snapshot.accountMode;
+    if (
+      this.brokerAccountMode === 'live' &&
+      this.exitPolicy !== 'CURRENT_BASELINE'
+    ) {
+      this.exitPolicy = 'CURRENT_BASELINE';
+      this.slog('Experimental exit policy reset to the current baseline for the live MT5 account.', 'warn');
+    }
     const hasUsableData =
       snapshot.candlesM1.length >= 25 &&
       snapshot.candlesM5.length >= 20 &&
@@ -844,15 +864,25 @@ export class TradingEngine {
       const beSafePrice = Number(
         (p.type === 'BUY' ? p.price_open + safeBeOffset : p.price_open - safeBeOffset).toFixed(cfg.digits)
       );
+      const manageProtectiveStops = this.exitPolicy !== 'FIXED_STRUCTURAL_TP';
+      const managePartialExit =
+        this.exitPolicy === 'CURRENT_BASELINE' || this.exitPolicy === 'PARTIAL_TRAILING';
       const beImprovesSl = p.type === 'BUY'
         ? (p.sl <= 0 || beSafePrice > p.sl + cfg.pointSize) && curPrice > beSafePrice
         : (p.sl <= 0 || beSafePrice < p.sl - cfg.pointSize) && curPrice < beSafePrice;
 
       const isM1Trade = (p.strategyRationale || '').includes('M1') || (p.comment || '').includes('M1');
-      const beRThreshold = isM1Trade ? 0.9 : 1.0;
+      const beRThreshold = this.exitPolicy === 'CURRENT_BASELINE' && isM1Trade ? 0.9 : 1.0;
 
       const lastPartialAt = this.livePartialAttemptedAt.get(p.ticket) ?? 0;
-      if (!p.partialTaken && rMultiple >= 1.35 && p.volume >= minVol * 2 && now - lastPartialAt >= 15_000) {
+      if (
+        this.autoBeEnabled &&
+        managePartialExit &&
+        !p.partialTaken &&
+        rMultiple >= 1.35 &&
+        p.volume >= minVol * 2 &&
+        now - lastPartialAt >= 15_000
+      ) {
         this.liveManagementInFlight.add(p.ticket);
         this.livePartialAttemptedAt.set(p.ticket, now);
         try {
@@ -873,7 +903,14 @@ export class TradingEngine {
       }
 
       const lastBeAt = this.liveBeAttemptedAt.get(p.ticket) ?? 0;
-      if (!p.beLocked && rMultiple >= beRThreshold && beImprovesSl && now - lastBeAt >= 15_000) {
+      if (
+        this.autoBeEnabled &&
+        manageProtectiveStops &&
+        !p.beLocked &&
+        rMultiple >= beRThreshold &&
+        beImprovesSl &&
+        now - lastBeAt >= 15_000
+      ) {
         this.liveManagementInFlight.add(p.ticket);
         this.liveBeAttemptedAt.set(p.ticket, now);
         try {
@@ -887,7 +924,7 @@ export class TradingEngine {
         continue;
       }
 
-      if (rMultiple >= 1.8) {
+      if (this.autoBeEnabled && manageProtectiveStops && rMultiple >= 1.8) {
         let zones: Zone[] = [];
         let atr = atrEstimate;
         if (posSym === this.activeSymbol) {
@@ -1611,6 +1648,21 @@ export class TradingEngine {
     return this.autoBeEnabled;
   }
 
+  setExitPolicy(policy: ExitManagementPolicy): void {
+    if (
+      policy !== 'CURRENT_BASELINE' &&
+      this.mt5Account.connected &&
+      this.brokerAccountMode !== 'demo' &&
+      this.brokerAccountMode !== 'contest'
+    ) {
+      throw new Error('Experimental exit policies are available only on a verified MT5 demo or contest account.');
+    }
+    this.exitPolicy = policy;
+    this.slog(`Exit management policy set to ${policy}.`, 'info');
+    this.invalidateEngine();
+    this.emit('engine');
+  }
+
   async toggleCircuitBreaker(targetState?: boolean): Promise<boolean> {
     const nextState = typeof targetState === 'boolean' ? targetState : !this.circuitBreakerEnabled;
     this.circuitBreakerEnabled = nextState;
@@ -2090,10 +2142,15 @@ export class TradingEngine {
     return this._cachedEvents;
   }
 
-  getRiskBasedVolume(stopLoss: number, requestedVolume?: number, _direction?: TradeDirection): number | null {
+  getRiskBasedVolume(
+    stopLoss: number,
+    requestedVolume?: number,
+    direction?: TradeDirection,
+    entryPriceOverride?: number
+  ): number | null {
     const spec = this.symbolSpec || (isTestRuntime() ? getDefaultSymbolSpec(this.activeSymbol) : null);
     if (!spec) return null;
-    const entryPrice = _direction === 'BUY' ? this.ask : this.bid;
+    const entryPrice = entryPriceOverride ?? (direction === 'BUY' ? this.ask : this.bid);
     const riskVolume = calculateRiskBasedVolume(
       this.account.equity,
       this.account.risk_pct,
@@ -2734,6 +2791,9 @@ export class TradingEngine {
         let partialTaken = p.partialTaken;
         let partialProfitLocked = p.partialProfitLocked;
         let currentVolume = p.volume;
+        const manageProtectiveStops = this.exitPolicy !== 'FIXED_STRUCTURAL_TP';
+        const managePartialExit =
+          this.exitPolicy === 'CURRENT_BASELINE' || this.exitPolicy === 'PARTIAL_TRAILING';
 
         // Risk Multiple (R) calculation for institutional scale-out
         const initialRiskPts = Math.abs(p.price_open - (p.initialSl || p.sl)) || (cfg.pipSize * 20);
@@ -2742,7 +2802,13 @@ export class TradingEngine {
         // 1. Multi-Tier Partial Profit Taking (Scale-Out)
         // Close 50% of volume at 1.5R, secure profits and cover commission, then move SL to Breakeven + 2 points.
         // Let remaining 50% run to the full 3.0R+ institutional POI.
-        if (this.autoBeEnabled && !partialTaken && rMultiple >= 1.5) {
+        const partialThreshold = this.exitPolicy === 'CURRENT_BASELINE' ? 1.5 : 1.35;
+        if (
+          this.autoBeEnabled &&
+          managePartialExit &&
+          !partialTaken &&
+          rMultiple >= partialThreshold
+        ) {
           const halfVolume = Number((currentVolume * 0.5).toFixed(2));
           if (halfVolume >= 0.01 && currentVolume - halfVolume >= 0.01) {
             let partialProfit = 0;
@@ -2791,13 +2857,15 @@ export class TradingEngine {
             beLocked = true;
 
             // Extend target for runner 50% to full 3.0R+ institutional POI
-            const institutional3R_tp = p.type === 'BUY'
-              ? p.price_open + 3.0 * initialRiskPts
-              : p.price_open - 3.0 * initialRiskPts;
-            if (p.type === 'BUY' && institutional3R_tp > currentTp) {
-              currentTp = Number(institutional3R_tp.toFixed(cfg.digits));
-            } else if (p.type === 'SELL' && institutional3R_tp < currentTp) {
-              currentTp = Number(institutional3R_tp.toFixed(cfg.digits));
+            if (this.exitPolicy === 'CURRENT_BASELINE') {
+              const institutional3R_tp = p.type === 'BUY'
+                ? p.price_open + 3.0 * initialRiskPts
+                : p.price_open - 3.0 * initialRiskPts;
+              if (p.type === 'BUY' && institutional3R_tp > currentTp) {
+                currentTp = Number(institutional3R_tp.toFixed(cfg.digits));
+              } else if (p.type === 'SELL' && institutional3R_tp < currentTp) {
+                currentTp = Number(institutional3R_tp.toFixed(cfg.digits));
+              }
             }
 
             this.slog(
@@ -2825,7 +2893,12 @@ export class TradingEngine {
         const spreadDistance = (spreadPts * cfg.pipSize) / (cfg.digits === 2 ? 10 : 1);
         const noiseDistance = 0.15 * (this._cachedMarket?.signal?.atr || cfg.pipSize * 5);
         const safeBeOffset = Number(Math.max(cfg.pipSize * 3, spreadDistance + noiseDistance).toFixed(cfg.digits));
-        if (this.autoBeEnabled && !beLocked && (pts >= cfg.pipSize * 15 || rMultiple >= 1.0)) {
+        if (
+          this.autoBeEnabled &&
+          manageProtectiveStops &&
+          !beLocked &&
+          (pts >= cfg.pipSize * 15 || rMultiple >= 1.0)
+        ) {
           beLocked = true;
           currentSl = Number((p.type === 'BUY' ? p.price_open + safeBeOffset : p.price_open - safeBeOffset).toFixed(cfg.digits));
           this.slog(`🛡️ ZERO-RISK BE LOCK: SL moved to $${currentSl.toFixed(cfg.digits)} (#${p.ticket}) · Spread protected!`, 'trade');
@@ -2838,7 +2911,7 @@ export class TradingEngine {
         // 3. Trailing Stop via Formed Order Block Swings
         // As price creates new structural swing highs/lows and closes beyond them (BOS),
         // trail the stop loss to the base of each newly confirmed Order Block rather than keeping it static.
-        if (this.autoBeEnabled && this._cachedMarket && this._cachedMarket.zones) {
+        if (this.autoBeEnabled && manageProtectiveStops && this._cachedMarket && this._cachedMarket.zones) {
           const activeObs = this._cachedMarket.zones.filter((z) => !z.filled && z.kind === 'OB');
           if (p.type === 'BUY') {
             // For BUY: Bullish OB base is bottom - 0.25 * ATR
@@ -3220,7 +3293,9 @@ export class TradingEngine {
         return;
       }
 
-      const blockReason = this.getEntryBlockReason(sig.direction, sig);
+      const orderTakeProfit = getExitPolicyTakeProfit(sig, this.exitPolicy);
+      const executionSignal = { ...sig, tp: orderTakeProfit };
+      const blockReason = this.getEntryBlockReason(sig.direction, executionSignal);
       if (blockReason) {
         this.recordRejectedSignal(sig, blockReason, this.activeSymbol);
         return;
@@ -3250,6 +3325,9 @@ export class TradingEngine {
       let volume: number;
       let executionSymbol = this.activeSymbol;
       let executionPrice = sig.direction === 'BUY' ? this.ask : this.bid;
+      let sizingEntryPrice = intendedPullbackLimit && validPullbackLimit
+        ? limitPrice as number
+        : executionPrice;
       if (this.mt5Account.connected) {
         if (!mt5Bridge.getStatus().connected) {
           this.recordRejectedSignal(sig, 'MT5 bridge is offline', this.activeSymbol);
@@ -3273,7 +3351,10 @@ export class TradingEngine {
           return;
         }
         executionPrice = sig.direction === 'BUY' ? ask as number : bid as number;
-        const sizing = this.getExecutionRiskVolume(undefined, sig.sl, executionPrice, executionSymbol);
+        sizingEntryPrice = intendedPullbackLimit && validPullbackLimit
+          ? limitPrice as number
+          : executionPrice;
+        const sizing = this.getExecutionRiskVolume(undefined, sig.sl, sizingEntryPrice, executionSymbol);
         if (sizing.volume === null) {
           const reason = sizing.rejectionReason || 'Position sizing error: broker specification cannot size stop safely';
           this.recordRejectedSignal(sig, reason, executionSymbol);
@@ -3282,7 +3363,12 @@ export class TradingEngine {
         }
         volume = sizing.volume;
       } else {
-        const paperVolume = this.getRiskBasedVolume(sig.sl);
+        const paperVolume = this.getRiskBasedVolume(
+          sig.sl,
+          undefined,
+          sig.direction,
+          sizingEntryPrice
+        );
         if (!paperVolume) {
           this.recordRejectedSignal(sig, 'Position sizing error: broker specification cannot size stop safely', this.activeSymbol);
           this.slog('Auto-trade blocked: broker symbol tick-value/volume specification cannot size this stop safely.', 'error');
@@ -3301,7 +3387,7 @@ export class TradingEngine {
             volume,
             symbol: executionSymbol,
             sl: sig.sl,
-            tp: sig.tp,
+            tp: orderTakeProfit,
             rationale,
             clientOrderId: `${executionSymbol}:${sig.strategy}:${sig.timeframe}:${sig.direction}:${sig.sourceCandleOpenTime}`,
             poiKey: this.getSignalPoiKey(sig.direction, sig.entry),
@@ -3331,9 +3417,9 @@ export class TradingEngine {
           );
           if (!result.pending) this.recordAcceptedEntry(sig.direction, sig);
           if (result.pending) {
-            this.recordPendingSignal(sig, result.ticket, volume, this.activeSymbol, rationale);
+            this.recordPendingSignal(executionSignal, result.ticket, volume, this.activeSymbol, rationale);
           } else {
-            this.recordExecutedSignal(sig, result.ticket, volume, this.activeSymbol, rationale);
+            this.recordExecutedSignal(executionSignal, result.ticket, volume, this.activeSymbol, rationale);
           }
           if (!result.pending) {
             recordTradeTaken({
@@ -3345,7 +3431,7 @@ export class TradingEngine {
               closePrice: result.price,
               openTime: new Date().toISOString(),
               sl: sig.sl,
-              tp: sig.tp,
+              tp: orderTakeProfit,
               profit: 0,
               pips: 0,
               reason: 'Manual',
@@ -3368,7 +3454,7 @@ export class TradingEngine {
               volume: result.filledVolume || volume,
               openPrice: result.price || sig.entry,
               sl: sig.sl,
-              tp: sig.tp,
+              tp: orderTakeProfit,
               ticket: result.positionTicket || result.ticket,
             });
           }
@@ -3401,7 +3487,7 @@ export class TradingEngine {
         sig.direction,
         volume,
         sig.sl,
-        sig.tp,
+        orderTakeProfit,
         `auto:${sig.score}`
       );
     }

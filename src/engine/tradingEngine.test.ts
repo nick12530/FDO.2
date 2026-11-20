@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { TradingEngine, getDefaultSymbolSpec } from './tradingEngine';
+import { TradingEngine, getDefaultSymbolSpec, getExitPolicyTakeProfit } from './tradingEngine';
 import { Candle } from '../types/smc';
 import { calculateRiskBasedVolume } from './riskConfig';
 import { mt5Bridge } from './mt5Bridge';
@@ -458,6 +458,25 @@ describe('final execution-boundary risk validation', () => {
       connected: true, serverUrl: 'test', lastPing: null, lastError: null, mode: 'demo',
     });
     vi.spyOn(engine, 'getEntryBlockReason').mockReturnValue(null);
+  });
+
+  it('keeps new exit policies demo-only and uses target three only for runner policies', () => {
+    const candidate = precisionAnalysis();
+    candidate.signal.tp1 = 2020;
+    candidate.signal.tp2 = 2025;
+    candidate.signal.tp3 = 2035;
+    expect(getExitPolicyTakeProfit(candidate.signal, 'CURRENT_BASELINE')).toBe(2032);
+    expect(getExitPolicyTakeProfit(candidate.signal, 'FIXED_STRUCTURAL_TP')).toBe(2032);
+    expect(getExitPolicyTakeProfit(candidate.signal, 'PARTIAL_TRAILING')).toBe(2035);
+    expect(getExitPolicyTakeProfit(candidate.signal, 'STRUCTURE_TRAILING')).toBe(2035);
+
+    (engine as any).brokerAccountMode = 'live';
+    expect(() => engine.setExitPolicy('PARTIAL_TRAILING')).toThrow(/demo or contest/i);
+    expect(engine.exitPolicy).toBe('CURRENT_BASELINE');
+
+    (engine as any).brokerAccountMode = 'demo';
+    engine.setExitPolicy('PARTIAL_TRAILING');
+    expect(engine.exitPolicy).toBe('PARTIAL_TRAILING');
   });
 
   it('rejects 0.01 EURUSD when minimum-lot risk exceeds the adaptive cap', () => {
