@@ -138,6 +138,36 @@ class TestServerTestDependencies(unittest.TestCase):
                 "UPDATE control_state SET state_value = 'false' WHERE state_key = 'trading_halted'"
             )
 
+    def test_disabling_circuit_breaker_does_not_disarm_kill_switch(self):
+        self.server.configure_mt5_adapter(FakeMT5Adapter())
+        with closing(sqlite3.connect(self.server.STATE_DATABASE)) as connection, connection:
+            connection.execute(
+                "UPDATE control_state SET state_value = 'true' WHERE state_key = 'trading_halted'"
+            )
+        request = SimpleNamespace(
+            headers={},
+            query_params={},
+            client=SimpleNamespace(host="testclient"),
+        )
+
+        self.server.set_circuit_breaker_control(
+            self.server.CircuitBreakerControlRequest(enabled=False),
+            request,
+        )
+
+        with closing(sqlite3.connect(self.server.STATE_DATABASE)) as connection:
+            halted = connection.execute(
+                "SELECT state_value FROM control_state WHERE state_key = 'trading_halted'"
+            ).fetchone()[0]
+        self.assertEqual(halted, "true")
+        with closing(sqlite3.connect(self.server.STATE_DATABASE)) as connection, connection:
+            connection.execute(
+                "UPDATE control_state SET state_value = 'false' WHERE state_key = 'trading_halted'"
+            )
+            connection.execute(
+                "UPDATE control_state SET state_value = 'true' WHERE state_key = 'circuit_breaker_enabled'"
+            )
+
     def test_execution_quote_validation_uses_executable_side_and_fails_closed(self):
         buy_price, spread = self.server.validate_execution_quote(
             SimpleNamespace(bid=1.1000, ask=1.1002), "BUY", 0.0001, 5, "EURUSD"

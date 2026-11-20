@@ -89,6 +89,13 @@ export interface TriggerPattern {
 
 export type TradeDirection = 'BUY' | 'SELL';
 export type InstrumentType = 'standard' | 'synthetic';
+export type SetupLifecycleStage =
+  | 'NO_SWEEP'
+  | 'SWEEP'
+  | 'DISPLACEMENT'
+  | 'STRUCTURE_BREAK'
+  | 'POI_RETEST'
+  | 'CONFIRMED';
 
 export interface HumanSignalExplanation {
   headline: string;
@@ -142,6 +149,7 @@ export interface Signal {
   regime?: 'TRENDING' | 'EXPANSION' | 'CHOP' | 'LOW_VOL';
   volumeMetrics?: VolumeMetrics;
   confluenceBreakdown?: MultiFactorConfluenceBreakdown;
+  setupLifecycleStage?: SetupLifecycleStage;
 }
 
 export interface Position {
@@ -230,7 +238,7 @@ export interface JournalSignalRecord {
   entry: number;
   sl: number;
   tp: number;
-  status: 'EXECUTED' | 'REJECTED';
+  status: 'PENDING' | 'EXECUTED' | 'REJECTED';
   rejectionReason?: string;
   ticket?: number;
   volume?: number;
@@ -471,7 +479,6 @@ export interface EngineState {
     leverage?: number;
   };
   leverage?: number;
-  allowHighConfluenceOverride?: boolean;
   autoSelectBestScenario?: boolean;
   executionMode?: 'MARKET' | 'PULLBACK_LIMIT';
 }
@@ -506,7 +513,6 @@ export interface AccountRiskConfig {
   auto_rr: number;
   daily_drawdown_pct: number;
   daily_loss_hit: boolean;
-  allowHighConfluenceOverride?: boolean;
   autoSelectBestScenario?: boolean;
 }
 

@@ -1,6 +1,6 @@
 import type { Candle, EconomicEvent, InstrumentType, Signal, SymbolTradingSpec } from '../types/smc';
 import type { HistoricalCandle, HistoricalTick } from './mt5Bridge';
-import { analyzeInstrument } from './multiPairScanner';
+import { analyzeInstrumentCandidates, isPrecisionExecutionReady } from './multiPairScanner';
 import { getGlobalSessionStatus } from './sessionTimezones';
 import { getInstrumentConfig, type SupportedSymbol } from './instrumentConfig';
 import { evaluateTechnicalStrategies } from './technicalStrategies';
@@ -12,7 +12,7 @@ const TIMEFRAME_MS: Record<Signal['timeframe'], number> = {
 };
 const MIN_RESOLVED_SAMPLES = 20;
 const MIN_OUT_OF_SAMPLE_RESOLVED_SAMPLES = 5;
-export const HISTORICAL_REPLAY_POLICY_VERSION = 1;
+export const HISTORICAL_REPLAY_POLICY_VERSION = 2;
 const MAX_CONTIGUOUS_TICK_GAP_MS = 60_000;
 
 export interface ReplayTickCoverage {
@@ -61,6 +61,7 @@ export interface ReplayFill {
 export interface ReplayMetrics {
   signalCount: number;
   filledCount: number;
+  fillRate: number | null;
   resolvedCount: number;
   wins: number;
   losses: number;
@@ -232,7 +233,7 @@ export function discoverSmcReplaySignals(
 
     const closed = <T extends Candle>(candles: T[], count: number) =>
       candles.slice(Math.max(0, count - 100), count);
-    const analysis = analyzeInstrument(
+    const analyses = analyzeInstrumentCandidates(
       symbol,
       closed(frames.M1, cursors.M1),
       closed(frames.M5, cursors.M5),
@@ -249,28 +250,33 @@ export function discoverSmcReplaySignals(
       {
         mode: 'replay',
         nowMs: quote.timeMs,
-        historicalEvents: options.historicalEvents ?? null,
+        historicalEvents: options.historicalEvents,
         sendAlerts: false,
         skipAccountSizing: true,
       }
     );
-    if (!analysis.signal) continue;
-    if (analysis.newsStatus === 'NEWS FILTER: DATA UNAVAILABLE') {
-      rejectedForUnavailableNews += 1;
-      continue;
+    for (const analysis of analyses) {
+      if (!analysis.signal) continue;
+      if (analysis.newsStatus === 'NEWS FILTER: DATA UNAVAILABLE') {
+        rejectedForUnavailableNews += 1;
+        continue;
+      }
+      if (
+        analysis.status !== 'READY' ||
+        !isPrecisionExecutionReady(analysis, 'PULLBACK_LIMIT', quote.timeMs)
+      ) {
+        otherRejected += 1;
+        continue;
+      }
+      const id = [
+        symbol,
+        analysis.signal.timeframe,
+        analysis.signal.strategy ?? 'SMC POI Retest',
+        analysis.signal.direction,
+        analysis.signal.sourceCandleOpenTime,
+      ].join(':');
+      unique.set(id, { ...analysis.signal, id, symbol });
     }
-    if (analysis.status !== 'READY') {
-      otherRejected += 1;
-      continue;
-    }
-    const id = [
-      symbol,
-      analysis.signal.timeframe,
-      analysis.signal.strategy ?? 'SMC POI Retest',
-      analysis.signal.direction,
-      analysis.signal.sourceCandleOpenTime,
-    ].join(':');
-    unique.set(id, { ...analysis.signal, id, symbol });
   }
   return {
     candidates: Array.from(unique.values()).sort(
@@ -500,12 +506,18 @@ function mean(values: number[]): number | null {
 
 export function summarizeReplayFills(
   fills: ReplayFill[],
-  roundTurnCostR: number | null = null
+  roundTurnCostR: number | null = null,
+  slippageR: number | null = null
 ): ReplayMetrics {
   const resolved = fills.filter((fill) => fill.grossR !== null);
   const grossValues = resolved.map((fill) => fill.grossR!);
-  const costsKnown = Number.isFinite(roundTurnCostR) && roundTurnCostR! >= 0;
-  const netValues = costsKnown ? grossValues.map((value) => value - roundTurnCostR!) : [];
+  const costsKnown =
+    Number.isFinite(roundTurnCostR) &&
+    roundTurnCostR! >= 0 &&
+    Number.isFinite(slippageR) &&
+    slippageR! >= 0;
+  const totalNonSpreadCostR = costsKnown ? roundTurnCostR! + slippageR! : 0;
+  const netValues = costsKnown ? grossValues.map((value) => value - totalNonSpreadCostR) : [];
   const winners = grossValues.filter((value) => value > 0).length;
   const grossWins = grossValues.filter((value) => value > 0).reduce((sum, value) => sum + value, 0);
   const grossLosses = Math.abs(grossValues.filter((value) => value < 0).reduce((sum, value) => sum + value, 0));
@@ -530,6 +542,9 @@ export function summarizeReplayFills(
   return {
     signalCount: fills.length,
     filledCount: fills.filter((fill) => fill.entryAt !== null).length,
+    fillRate: fills.length
+      ? fills.filter((fill) => fill.entryAt !== null).length / fills.length
+      : null,
     resolvedCount: resolved.length,
     wins: winners,
     losses: grossValues.filter((value) => value < 0).length,
@@ -555,7 +570,8 @@ export function summarizeReplayFills(
 function groupMetrics(
   fills: ReplayFill[],
   key: (fill: ReplayFill) => string,
-  roundTurnCostR: number | null
+  roundTurnCostR: number | null,
+  slippageR: number | null
 ): Record<string, ReplayMetrics> {
   const groups = new Map<string, ReplayFill[]>();
   for (const fill of fills) {
@@ -563,14 +579,21 @@ function groupMetrics(
     groups.set(value, [...(groups.get(value) ?? []), fill]);
   }
   return Object.fromEntries(
-    Array.from(groups, ([name, rows]) => [name, summarizeReplayFills(rows, roundTurnCostR)])
+    Array.from(groups, ([name, rows]) => [
+      name,
+      summarizeReplayFills(rows, roundTurnCostR, slippageR),
+    ])
   );
 }
 
 export function replayHistoricalSignals(
   signals: ReplayCandidate[],
   historicalTicks: HistoricalTick[],
-  options: { roundTurnCostR?: number; ticksAvailable?: boolean } = {}
+  options: {
+    roundTurnCostR?: number;
+    slippageR?: number;
+    ticksAvailable?: boolean;
+  } = {}
 ): HistoricalReplayResult {
   const ticks = historicalTicks.filter(isValidQuote).sort((a, b) => a.timeMs - b.timeMs);
   const fills = signals.map((signal) => replayOne(signal, ticks));
@@ -595,7 +618,9 @@ export function replayHistoricalSignals(
       (fill.exitAt === null || fill.exitAt < cutoffTime)
   );
   const testing = fills.filter((fill) => cutoffTime !== null && fill.discoveredAt >= cutoffTime);
-  const resultMetrics = summarizeReplayFills(fills, options.roundTurnCostR ?? null);
+  const roundTurnCostR = options.roundTurnCostR ?? null;
+  const slippageR = options.slippageR ?? null;
+  const resultMetrics = summarizeReplayFills(fills, roundTurnCostR, slippageR);
   const unavailableReasons: string[] = [];
   if (!options.ticksAvailable || ticks.length === 0) {
     unavailableReasons.push('Genuine bid/ask tick history is unavailable; fills and performance are not established.');
@@ -605,8 +630,11 @@ export function replayHistoricalSignals(
       `${gapsOver60Seconds} tick-data gaps exceeded 60 seconds; any replay position crossing such a gap is unresolved.`
     );
   }
-  if (!Number.isFinite(options.roundTurnCostR) || options.roundTurnCostR! < 0) {
-    unavailableReasons.push('Broker transaction-cost schedule was not provided; net expectancy, profit factor, and net drawdown are unavailable.');
+  if (!Number.isFinite(roundTurnCostR) || roundTurnCostR! < 0) {
+    unavailableReasons.push('Broker round-turn commission schedule was not provided; net expectancy, profit factor, and net drawdown are unavailable.');
+  }
+  if (!Number.isFinite(slippageR) || slippageR! < 0) {
+    unavailableReasons.push('A slippage estimate was not provided; net performance is unavailable.');
   }
   if (fills.filter((fill) => fill.grossR !== null).length < MIN_RESOLVED_SAMPLES) {
     unavailableReasons.push(`Fewer than ${MIN_RESOLVED_SAMPLES} resolved broker-tick samples; performance is insufficient.`);
@@ -624,18 +652,18 @@ export function replayHistoricalSignals(
     metrics: resultMetrics,
     outOfSample: {
       cutoffTime,
-      training: summarizeReplayFills(training, options.roundTurnCostR ?? null),
-      testing: summarizeReplayFills(testing, options.roundTurnCostR ?? null),
+      training: summarizeReplayFills(training, roundTurnCostR, slippageR),
+      testing: summarizeReplayFills(testing, roundTurnCostR, slippageR),
     },
     groups: {
-      symbol: groupMetrics(fills, (fill) => fill.symbol, options.roundTurnCostR ?? null),
-      session: groupMetrics(fills, (fill) => fill.session, options.roundTurnCostR ?? null),
-      timeframe: groupMetrics(fills, (fill) => fill.timeframe, options.roundTurnCostR ?? null),
-      strategy: groupMetrics(fills, (fill) => fill.strategy, options.roundTurnCostR ?? null),
+      symbol: groupMetrics(fills, (fill) => fill.symbol, roundTurnCostR, slippageR),
+      session: groupMetrics(fills, (fill) => fill.session, roundTurnCostR, slippageR),
+      timeframe: groupMetrics(fills, (fill) => fill.timeframe, roundTurnCostR, slippageR),
+      strategy: groupMetrics(fills, (fill) => fill.strategy, roundTurnCostR, slippageR),
       scoreRange: groupMetrics(fills, (fill) => {
         const lower = Math.floor(fill.score / 10) * 10;
         return `${lower}-${lower + 9}`;
-      }, options.roundTurnCostR ?? null),
+      }, roundTurnCostR, slippageR),
     },
     tickCoverage: {
       tickCount: ticks.length,

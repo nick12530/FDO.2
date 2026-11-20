@@ -93,7 +93,7 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
 }) => {
   const [activeTab, setActiveTab] = useState<'calendar' | 'trades' | 'signals'>(defaultTab);
   const [tradeFilter, setTradeFilter] = useState<'all' | 'running' | 'closed'>('all');
-  const [signalFilter, setSignalFilter] = useState<'all' | 'executed' | 'rejected'>('all');
+  const [signalFilter, setSignalFilter] = useState<'all' | 'pending' | 'executed' | 'rejected'>('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [isSyncingMt5, setIsSyncingMt5] = useState(false);
   const [syncNotice, setSyncNotice] = useState<string | null>(null);
@@ -291,6 +291,7 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
     const reversed = [...journalSignals].reverse();
     return reversed.filter((sig) => {
       if (signalFilter === 'executed' && sig.status !== 'EXECUTED') return false;
+      if (signalFilter === 'pending' && sig.status !== 'PENDING') return false;
       if (signalFilter === 'rejected' && sig.status !== 'REJECTED') return false;
       if (searchQuery.trim()) {
         const q = searchQuery.toLowerCase();
@@ -315,6 +316,7 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
   const totalNet = Number(closedOnly.reduce((sum, t) => sum + t.profit, 0).toFixed(2));
 
   const totalSignalsCount = journalSignals.length;
+  const pendingSignalsCount = journalSignals.filter((s) => s.status === 'PENDING').length;
   const executedSignalsCount = journalSignals.filter((s) => s.status === 'EXECUTED').length;
   const rejectedSignalsCount = journalSignals.filter((s) => s.status === 'REJECTED').length;
 
@@ -539,11 +541,17 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
               </div>
             </div>
           ) : (
-            <div className="grid grid-cols-3 gap-2.5">
+            <div className="grid grid-cols-4 gap-2.5">
               <div className="p-3 rounded-xl border border-slate-200 dark:border-[#2b3b59] bg-slate-50/70 dark:bg-[#141f35]">
                 <span className="text-[10px] uppercase font-bold text-slate-500 dark:text-slate-400 block">Signals Logged</span>
                 <strong className="text-sm font-extrabold text-slate-900 dark:text-white tabular-nums block mt-0.5">
                   {totalSignalsCount}
+                </strong>
+              </div>
+              <div className="p-3 rounded-xl border border-slate-200 dark:border-[#2b3b59] bg-slate-50/70 dark:bg-[#141f35]">
+                <span className="text-[10px] uppercase font-bold text-amber-600 dark:text-amber-400 block">Pending</span>
+                <strong className="text-sm font-extrabold text-amber-600 dark:text-amber-400 tabular-nums block mt-0.5">
+                  {pendingSignalsCount}
                 </strong>
               </div>
               <div className="p-3 rounded-xl border border-slate-200 dark:border-[#2b3b59] bg-slate-50/70 dark:bg-[#141f35]">
@@ -825,6 +833,7 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
                     {(
                       [
                         { id: 'all', label: `All (${totalSignalsCount})`, activeClass: 'bg-slate-900 text-white dark:bg-sky-500 dark:text-slate-950' },
+                        { id: 'pending', label: `Pending (${pendingSignalsCount})`, activeClass: 'bg-amber-500 text-white' },
                         { id: 'executed', label: `Executed (${executedSignalsCount})`, activeClass: 'bg-emerald-600 text-white' },
                         { id: 'rejected', label: `Filtered (${rejectedSignalsCount})`, activeClass: 'bg-rose-600 text-white' },
                       ] as const
@@ -988,6 +997,7 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
                   <tbody className="divide-y divide-slate-100 dark:divide-[#23314c]">
                     {filteredSignals.map((sig) => {
                       const isExecuted = sig.status === 'EXECUTED';
+                      const isPending = sig.status === 'PENDING';
                       const d = getInstrumentConfig(sig.symbol as SupportedSymbol).digits;
                       return (
                         <tr
@@ -1020,14 +1030,24 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
                             </div>
                           </td>
                           <td className="py-2.5 px-2">
-                            <span className={`font-bold text-[11px] ${isExecuted ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}`}>
-                              {isExecuted ? 'EXECUTED' : 'REJECTED'}
+                            <span className={`font-bold text-[11px] ${
+                              isExecuted
+                                ? 'text-emerald-600 dark:text-emerald-400'
+                                : isPending
+                                  ? 'text-amber-600 dark:text-amber-400'
+                                  : 'text-rose-600 dark:text-rose-400'
+                            }`}>
+                              {sig.status}
                             </span>
                           </td>
                           <td className="py-2.5 px-3">
                             {isExecuted ? (
                               <div className="text-emerald-600 dark:text-emerald-400 font-medium">
                                 Order #{sig.ticket || '—'} ({sig.volume || 0.01}L)
+                              </div>
+                            ) : isPending ? (
+                              <div className="text-amber-600 dark:text-amber-400 font-medium">
+                                Awaiting broker fill · Order #{sig.ticket || '—'}
                               </div>
                             ) : (
                               <div className="text-rose-600 dark:text-rose-400 font-medium">

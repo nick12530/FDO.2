@@ -4,6 +4,9 @@ import {
   closedTradeDayKey,
   findCorrespondingOrderBlock,
   localDayKey,
+  readStoredJournalSignals,
+  reconcileFilledJournalSignals,
+  recordJournalSignal,
 } from './tradeJournal';
 import type { ClosedTrade, Signal, Zone } from '../types/smc';
 
@@ -64,5 +67,29 @@ describe('trade journal helpers', () => {
     expect(findCorrespondingOrderBlock('BUY', 99.5, zones)?.born).toBe(1);
     expect(findCorrespondingOrderBlock('SELL', 99.5, zones)?.born).toBe(3);
     expect(findCorrespondingOrderBlock('BUY', 150, [])).toBeUndefined();
+  });
+
+  it('marks a pending signal executed only after its broker ticket appears as a position', () => {
+    const ticket = 987654321;
+    const pending = recordJournalSignal({
+      id: `pending-test-${ticket}`,
+      symbol: 'XAUUSD',
+      direction: 'BUY',
+      strategy: 'SMC',
+      timeframe: 'M1',
+      score: 80,
+      entry: 2300,
+      sl: 2295,
+      tp: 2310,
+      status: 'PENDING',
+      ticket,
+      volume: 0.01,
+    });
+
+    reconcileFilledJournalSignals([]);
+    expect(readStoredJournalSignals().find((signal) => signal.id === pending.id)?.status).toBe('PENDING');
+
+    reconcileFilledJournalSignals([ticket]);
+    expect(readStoredJournalSignals().find((signal) => signal.id === pending.id)?.status).toBe('EXECUTED');
   });
 });

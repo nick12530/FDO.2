@@ -67,6 +67,8 @@ export const HistoricalReplayPanel: React.FC<HistoricalReplayPanelProps> = ({
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [run, setRun] = useState<ReplayRun | null>(null);
+  const [commissionCostR, setCommissionCostR] = useState('');
+  const [slippageR, setSlippageR] = useState('');
   const requestGeneration = useRef(0);
   const supportedSymbol = getSupportedSymbol(requestedSymbol);
 
@@ -80,6 +82,15 @@ export const HistoricalReplayPanel: React.FC<HistoricalReplayPanelProps> = ({
   const executeReplay = async () => {
     if (!supportedSymbol) {
       setError(`Historical replay is not configured for ${requestedSymbol}.`);
+      return;
+    }
+    const commissionCost = commissionCostR.trim() ? Number(commissionCostR) : undefined;
+    const slippageCost = slippageR.trim() ? Number(slippageR) : undefined;
+    if (
+      (commissionCost !== undefined && (!Number.isFinite(commissionCost) || commissionCost < 0)) ||
+      (slippageCost !== undefined && (!Number.isFinite(slippageCost) || slippageCost < 0))
+    ) {
+      setError('Commission and slippage assumptions must be finite non-negative R values.');
       return;
     }
     const generation = ++requestGeneration.current;
@@ -124,6 +135,8 @@ export const HistoricalReplayPanel: React.FC<HistoricalReplayPanelProps> = ({
       const signals = [...technicalSignals, ...smcDiscovery.candidates];
       const result = replayHistoricalSignals(signals, ticks, {
         ticksAvailable: tickResponse.count > 0,
+        ...(commissionCost !== undefined ? { roundTurnCostR: commissionCost } : {}),
+        ...(slippageCost !== undefined ? { slippageR: slippageCost } : {}),
       });
       if (smcDiscovery.unavailableReason) {
         result.unavailableReasons.unshift(smcDiscovery.unavailableReason);
@@ -192,11 +205,38 @@ export const HistoricalReplayPanel: React.FC<HistoricalReplayPanelProps> = ({
             <p>
               Trend-continuation and volatility-breakout strategies are replayed from closed broker candles.
               SMC and liquidity-reversal strategies are withheld because historical news archives are unavailable;
-              broker transaction-cost schedules are also unavailable, so net performance is withheld.
+              spread is measured from bid/ask ticks, but commission and slippage inputs are required for net performance.
               Gross R excludes fees and is not a forecast.
             </p>
           </div>
         </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3">
+        <label className="space-y-1 text-slate-600 dark:text-slate-300">
+          <span>Round-turn commission assumption (R)</span>
+          <input
+            type="number"
+            min="0"
+            step="0.01"
+            value={commissionCostR}
+            onChange={(event) => setCommissionCostR(event.target.value)}
+            className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-2 font-mono dark:border-[#2b3b59] dark:bg-[#101722]"
+            placeholder="Unavailable"
+          />
+        </label>
+        <label className="space-y-1 text-slate-600 dark:text-slate-300">
+          <span>Round-turn slippage assumption (R)</span>
+          <input
+            type="number"
+            min="0"
+            step="0.01"
+            value={slippageR}
+            onChange={(event) => setSlippageR(event.target.value)}
+            className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-2 font-mono dark:border-[#2b3b59] dark:bg-[#101722]"
+            placeholder="Unavailable"
+          />
+        </label>
       </div>
 
       {error && <p role="alert" className="rounded-lg border border-rose-500/25 bg-rose-500/5 p-3 text-rose-700 dark:text-rose-300">{error}</p>}
@@ -216,9 +256,10 @@ export const HistoricalReplayPanel: React.FC<HistoricalReplayPanelProps> = ({
             {' · '}{result.tickCoverage.gapsOver60Seconds} gaps over 60s; positions spanning such gaps remain unresolved.
           </p>
 
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
             <Metric label="Signals" value={String(metrics.signalCount)} />
             <Metric label="Filled / resolved" value={`${metrics.filledCount} / ${metrics.resolvedCount}`} />
+            <Metric label="Fill rate" value={metrics.fillRate === null ? '—' : `${(metrics.fillRate * 100).toFixed(1)}%`} />
             <Metric label="Gross expectancy (R)" value={!performanceSufficient || metrics.grossExpectancyR === null ? 'Insufficient samples' : metrics.grossExpectancyR.toFixed(2)} />
             <Metric label="Gross profit factor" value={!performanceSufficient || metrics.grossProfitFactor === null ? 'Insufficient samples' : Number.isFinite(metrics.grossProfitFactor) ? metrics.grossProfitFactor.toFixed(2) : 'Unbounded'} />
           </div>
@@ -227,7 +268,18 @@ export const HistoricalReplayPanel: React.FC<HistoricalReplayPanelProps> = ({
             <Metric label="Gross win rate" value={metrics.winRate === null ? '—' : `${(metrics.winRate * 100).toFixed(1)}% (${metrics.wins}/${metrics.resolvedCount})`} />
             <Metric label="Gross max drawdown (R)" value={metrics.grossMaxDrawdownR === null ? '—' : `${metrics.grossMaxDrawdownR.toFixed(2)}R`} />
             <Metric label="Average MFE / MAE (R)" value={`${metrics.averageMfeR?.toFixed(2) ?? '—'} / ${metrics.averageMaeR?.toFixed(2) ?? '—'}`} />
-            <Metric label="Net expectancy / PF" value="Unavailable: costs" />
+            <Metric
+              label="Net expectancy / PF"
+              value={!metrics.transactionCostsKnown || !performanceSufficient
+                ? 'Unavailable: commission / slippage'
+                : `${metrics.netExpectancyR?.toFixed(2) ?? '—'}R / ${
+                    metrics.netProfitFactor === null
+                      ? '—'
+                      : Number.isFinite(metrics.netProfitFactor)
+                        ? metrics.netProfitFactor.toFixed(2)
+                        : 'Unbounded'
+                  }`}
+            />
           </div>
 
           <div className="rounded-lg border border-slate-200 p-3 dark:border-[#2b3b59]">
@@ -252,6 +304,7 @@ export const HistoricalReplayPanel: React.FC<HistoricalReplayPanelProps> = ({
               </thead>
               <tbody className="divide-y divide-slate-100 dark:divide-[#2b3b59]">
                 {([
+                  { label: 'Symbol', rows: result.groups.symbol },
                   { label: 'Strategy', rows: result.groups.strategy },
                   { label: 'Session', rows: result.groups.session },
                   { label: 'Timeframe', rows: result.groups.timeframe },

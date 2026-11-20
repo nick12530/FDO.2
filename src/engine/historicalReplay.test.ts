@@ -106,7 +106,7 @@ describe('historical tick replay', () => {
         tick(1_060_000, 1.1000, 1.1002),
         tick(1_070_000, 1.1020, 1.1022),
       ],
-      { ticksAvailable: true, roundTurnCostR: 0.1 }
+      { ticksAvailable: true, roundTurnCostR: 0.1, slippageR: 0.02 }
     );
 
     expect(result.fills[0]).toMatchObject({
@@ -118,7 +118,8 @@ describe('historical tick replay', () => {
     expect(result.fills[0].grossR).toBeCloseTo(1.5);
     expect(result.fills[0].mfeR).toBeCloseTo(1.5);
     expect(result.fills[0].maeR).toBeCloseTo(1 / 6);
-    expect(result.metrics.netExpectancyR).toBeCloseTo(1.4);
+    expect(result.metrics.netExpectancyR).toBeCloseTo(1.38);
+    expect(result.metrics.fillRate).toBe(1);
   });
 
   it('marks trades unresolved across gaps in broker tick coverage', () => {
@@ -166,7 +167,10 @@ describe('historical tick replay', () => {
     expect(result.metrics.netProfitFactor).toBeNull();
     expect(result.metrics.grossMaxDrawdownR).not.toBeNull();
     expect(result.unavailableReasons).toContain(
-      'Broker transaction-cost schedule was not provided; net expectancy, profit factor, and net drawdown are unavailable.'
+      'Broker round-turn commission schedule was not provided; net expectancy, profit factor, and net drawdown are unavailable.'
+    );
+    expect(result.unavailableReasons).toContain(
+      'A slippage estimate was not provided; net performance is unavailable.'
     );
   });
 

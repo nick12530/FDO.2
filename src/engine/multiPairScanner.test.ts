@@ -2,12 +2,14 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { INSTRUMENTS, SUPPORTED_SYMBOLS, getInstrumentConfig, getSupportedSymbol } from './instrumentConfig';
 import {
   analyzeInstrument,
+  analyzeInstrumentCandidates,
   rankOpportunities,
   checkCorrelationExposure,
   calculateSmallAccountPositionSize,
   findLiquidityLevels,
   hasDirectionalMovement,
   isPrecisionEntryImminent,
+  isPrecisionExecutionReady,
   isPrecisionEntryReady,
 } from './multiPairScanner';
 import { normalizeRawConfluenceScore, SCANNER_RAW_SCORE_MAX } from './scorePolicy';
@@ -54,8 +56,10 @@ describe('Multi-Pair Market Scanner & Instrument System', () => {
         candleConfirm: 3,
       },
       riskRewardRatio: 3,
+      spreadAdjustedRiskRewardRatio: 3,
       expiryTimestamp: 120_000,
       status: 'READY' as const,
+      setupLifecycleStage: 'CONFIRMED' as const,
       signal: {
         direction: 'BUY' as const,
         timeframe: 'M5' as const,
@@ -74,6 +78,7 @@ describe('Multi-Pair Market Scanner & Instrument System', () => {
     };
 
     expect(isPrecisionEntryReady(candidate, 60_000)).toBe(true);
+    expect(isPrecisionExecutionReady(candidate, 'MARKET', 60_000)).toBe(true);
     const boundaryCandidates = [99, 100, 101].map((rawScore) => ({
       ...candidate,
       confluenceScore: normalizeRawConfluenceScore(rawScore, SCANNER_RAW_SCORE_MAX),
@@ -108,6 +113,43 @@ describe('Multi-Pair Market Scanner & Instrument System', () => {
       bid: 1998.9,
       ask: 1999.1,
     }, 60_000)).toBe(false);
+    const pullback = {
+      ...candidate,
+      bid: 2002.9,
+      ask: 2003.1,
+      signal: { ...candidate.signal, executionMode: 'PULLBACK_LIMIT' as const },
+    };
+    expect(isPrecisionEntryReady(pullback, 60_000)).toBe(false);
+    expect(isPrecisionExecutionReady(pullback, 'MARKET', 60_000)).toBe(true);
+    expect(isPrecisionExecutionReady({
+      ...pullback,
+      setupLifecycleStage: 'SWEEP',
+    }, 'MARKET', 60_000)).toBe(false);
+  });
+
+  it('creates independent M1, M5, and M15 execution candidates', () => {
+    const data = generatePairCandles('EURUSD', 80);
+    const candidates = analyzeInstrumentCandidates(
+      'EURUSD',
+      data.candlesM1,
+      data.candlesM5,
+      data.candlesM15,
+      data.candlesH1,
+      data.currentBid,
+      data.currentAsk,
+      data.spreadPoints,
+      100,
+      1,
+      [],
+      null,
+      undefined,
+      { sendAlerts: false }
+    );
+
+    expect(candidates.map((candidate) => candidate.executionTimeframe)).toEqual(['M1', 'M5', 'M15']);
+    expect(candidates.every((candidate) =>
+      !candidate.signal || candidate.signal.timeframe === candidate.executionTimeframe
+    )).toBe(true);
   });
 
   it('detects liquidity sweeps only when a wick breaches and closes back inside prior liquidity', () => {

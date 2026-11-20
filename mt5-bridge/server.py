@@ -1059,8 +1059,6 @@ def set_circuit_breaker_control(payload: CircuitBreakerControlRequest, request: 
             "INSERT OR REPLACE INTO control_state (state_key, state_value) VALUES ('circuit_breaker_enabled', ?)",
             ("true" if payload.enabled else "false",),
         )
-        if not payload.enabled:
-            connection.execute("UPDATE control_state SET state_value = 'false' WHERE state_key = 'trading_halted'")
     logger.info(f"⚡ Circuit breaker protection {'ENABLED' if payload.enabled else 'DISABLED'} by user.")
     return {"circuitBreakerEnabled": payload.enabled}
 
@@ -1445,7 +1443,7 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
     payload.volume = max(vol_min, min(vol_max, payload.volume))
 
     open_positions = read_positions()
-    max_positions = max(5, int(RISK_CONFIG.get("maxOpenPositions", 5)))
+    max_positions = max(0, int(RISK_CONFIG.get("maxOpenPositions", 5)))
     if len(open_positions) >= max_positions:
         logger.warning(f"🚫 [423 Locked] Maximum open-position limit reached ({len(open_positions)}/{max_positions}).")
         raise HTTPException(
@@ -1624,6 +1622,7 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
         allow_micro_floor=allow_micro_floor,
         equity=account["equity"],
         max_micro_floor_risk=float(RISK_CONFIG.get("maxMicroFloorRiskDollar", 15.0)),
+        max_micro_floor_risk_percent=float(RISK_CONFIG.get("maxMicroFloorRiskPercent", 3.5)),
     )
     if safe_volume is None:
         min_lot_risk = risk_per_lot * vol_min
@@ -1814,6 +1813,7 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
                     allow_micro_floor=allow_micro_floor,
                     equity=account["equity"],
                     max_micro_floor_risk=float(RISK_CONFIG.get("maxMicroFloorRiskDollar", 15.0)),
+                    max_micro_floor_risk_percent=float(RISK_CONFIG.get("maxMicroFloorRiskPercent", 3.5)),
                 )
                 current_portfolio_safe_volume = volume_for_risk(
                     current_portfolio_budget,

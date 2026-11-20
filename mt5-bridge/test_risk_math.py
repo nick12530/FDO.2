@@ -1,9 +1,29 @@
+import json
+from pathlib import Path
 import unittest
 
 from risk_math import is_valid_close_volume, stop_risk, volume_for_risk
 
 
 class RiskMathTests(unittest.TestCase):
+    def test_shared_risk_parity_cases(self) -> None:
+        cases_path = Path(__file__).resolve().parents[1] / "risk-parity-cases.json"
+        cases = json.loads(cases_path.read_text(encoding="utf-8"))
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                result = volume_for_risk(
+                    case["riskBudget"],
+                    case["riskPerLot"],
+                    case["volumeMin"],
+                    case["volumeStep"],
+                    case["volumeMax"],
+                    allow_micro_floor=True,
+                    equity=case["equity"],
+                    max_micro_floor_risk=case["maxMicroFloorRisk"],
+                    max_micro_floor_risk_percent=case["maxMicroFloorRiskPercent"],
+                )
+                self.assertEqual(result, case["expectedVolume"])
+
     def test_stop_risk_counts_only_adverse_distance(self) -> None:
         self.assertEqual(stop_risk("BUY", 0.1, 100, 90, 1, 2), 2.0)
         self.assertEqual(stop_risk("SELL", 0.1, 100, 110, 1, 2), 2.0)
@@ -16,7 +36,7 @@ class RiskMathTests(unittest.TestCase):
     def test_minimum_volume_never_exceeds_risk_budget(self) -> None:
         self.assertIsNone(volume_for_risk(0.1, 20, 0.01, 0.01, 1))
         self.assertEqual(volume_for_risk(1, 20, 0.01, 0.01, 1), 0.05)
-        # Adaptive micro-floor permits 0.01 if dollar risk <= $15
+        # Adaptive micro-floor permits 0.01 only when both configured caps pass.
         self.assertEqual(
             volume_for_risk(1.66, 237, 0.01, 0.01, 1, allow_micro_floor=True, equity=332),
             0.01,

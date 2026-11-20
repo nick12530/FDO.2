@@ -12,6 +12,7 @@ import { Candle } from '../types/smc';
 import { calculateRiskBasedVolume } from './riskConfig';
 import { mt5Bridge } from './mt5Bridge';
 import { SUPPORTED_SYMBOLS } from './instrumentConfig';
+import * as tradeJournal from './tradeJournal';
 
 describe('risk-based position sizing', () => {
   it('sizes a known XAU-style contract from equity, stop, tick value, and broker lot step', () => {
@@ -363,7 +364,7 @@ describe('scanner signals in the active signal engine', () => {
     };
 
     expect(engine.getEntryBlockReason('BUY', signal, Date.now(), false, 'EURUSD')).toBe(
-      'TRADE_REJECTED: NEWS_DATA_UNAVAILABLE'
+      'TRADE_REJECTED: SCANNER_SIGNAL_UNAVAILABLE'
     );
   });
 });
@@ -399,6 +400,54 @@ const flatCandles = (count: number, intervalMs: number, breakout = false): Candl
 describe('final execution-boundary risk validation', () => {
   let engine: TradingEngine;
 
+  const precisionAnalysis = (executionMode: 'MARKET' | 'PULLBACK_LIMIT' = 'MARKET') => {
+    const now = Date.now();
+    return {
+      symbol: 'XAUUSD',
+      price: 2000.05,
+      bid: 2000,
+      ask: 2000.1,
+      atr: 10,
+      spreadAcceptable: true,
+      confluenceScore: 90,
+      scoreBreakdown: {
+        htfAlignment: 20,
+        structureConfirm: 16,
+        liquiditySweep: 15,
+        bosChoch: 5,
+        obFvgReaction: 10,
+        momentumConfirm: 8,
+        sessionConfirm: 5,
+        spreadAcceptable: 5,
+        candleConfirm: 3,
+      },
+      riskRewardRatio: 3,
+      spreadAdjustedRiskRewardRatio: 3,
+      expiryTimestamp: now + 60_000,
+      status: 'READY',
+      setupLifecycleStage: 'CONFIRMED',
+      signal: {
+        direction: 'BUY',
+        timeframe: 'M5',
+        score: 90,
+        scoringPolicyVersion: 3,
+        strategy: 'SMC POI Retest',
+        entry: 2000.1,
+        sl: 1990,
+        tp: 2032,
+        reasons: [],
+        atr: 10,
+        timestamp: new Date(now).toISOString(),
+        sourceCandleOpenTime: Math.floor(now / 60_000) * 60_000,
+        expiryTimestamp: now + 60_000,
+        isSniper: true,
+        sniperGrade: 'A+',
+        optimalTradeEntry: executionMode === 'MARKET' ? 2000.1 : 1998,
+        executionMode,
+      },
+    } as any;
+  };
+
   beforeEach(() => {
     if (typeof localStorage !== 'undefined') localStorage.clear();
     engine = new TradingEngine();
@@ -427,7 +476,7 @@ describe('final execution-boundary risk validation', () => {
     expect(engine.positions).toHaveLength(0);
   });
 
-  it('does not send an auto MT5 order when the selected signal stop exceeds the minimum-lot risk budget', async () => {
+  it('rejects a high-score technical signal without a READY precision scanner candidate', async () => {
     engine.account.equity = 92;
     engine.account.risk_pct = 0.5;
     engine.activeSymbol = 'EURUSD';
@@ -437,7 +486,6 @@ describe('final execution-boundary risk validation', () => {
     engine.instrumentType = 'synthetic';
     engine.autoTrade = true;
     vi.spyOn(mt5Bridge, 'getSymbol').mockReturnValue('EURUSD');
-    const rejectedSignal = vi.spyOn(engine, 'recordRejectedSignal');
     const sendTrade = vi.spyOn(mt5Bridge, 'sendTrade').mockResolvedValue({
       ticket: 123, positionTicket: 123, price: 1.10002, filledVolume: 0.01,
     } as any);
@@ -453,14 +501,9 @@ describe('final execution-boundary risk validation', () => {
     await engine.evaluateAutoExecution();
 
     expect(sendTrade).not.toHaveBeenCalled();
-    expect(rejectedSignal).toHaveBeenCalledWith(
-      expect.objectContaining({ sl: 1.09502 }),
-      expect.stringContaining('TRADE_REJECTED: MINIMUM_LOT_EXCEEDS_RISK'),
-      'EURUSD'
-    );
   });
 
-  it('allows a qualifying normalized technical signal at the configured 60/100 threshold', async () => {
+  it('executes only the confirmed scanner signal and deduplicates by source candle', async () => {
     engine.account.equity = 10_000;
     engine.account.risk_pct = 0.5;
     engine.activeSymbol = 'XAUUSD';
@@ -480,31 +523,22 @@ describe('final execution-boundary risk validation', () => {
       partial: false,
       pending: false,
     });
-    const signal = {
-      direction: 'BUY' as const,
-      entry: 2000,
-      sl: 1990,
-      tp: 2032,
-      score: 68,
-      scoringPolicyVersion: 3,
-      strategy: 'Trend Pullback' as const,
-      timeframe: 'M5' as const,
-      timestamp: new Date().toISOString(),
-      expiryTimestamp: Date.now() + 60_000,
-    };
+    const candidate = precisionAnalysis();
+    engine.scannerAnalyses = [candidate];
     vi.spyOn(engine, 'getMarketSnapshot').mockReturnValue({
       brokerMarketData: true,
       zones: [],
-      signals: [signal],
-      signal,
+      signals: [candidate.signal],
+      signal: candidate.signal,
     } as any);
 
+    await engine.evaluateAutoExecution();
     await engine.evaluateAutoExecution();
 
     expect(sendTrade).toHaveBeenCalledTimes(1);
   });
 
-  it('pauses auto-trade after MT5 reports trading disabled and does not retry', async () => {
+  it('submits a pullback setup as a limit and does not mark its pending order as filled', async () => {
     engine.account.equity = 10_000;
     engine.account.risk_pct = 0.5;
     engine.activeSymbol = 'XAUUSD';
@@ -514,35 +548,41 @@ describe('final execution-boundary risk validation', () => {
     (engine as any).symbolSpec = getDefaultSymbolSpec('XAUUSD');
     engine.autoTrade = true;
     vi.spyOn(mt5Bridge, 'getSymbol').mockReturnValue('XAUUSD');
-    const sendTrade = vi.spyOn(mt5Bridge, 'sendTrade').mockRejectedValue(
-      new Error('MT5 has disabled trading for XAUUSD (retcode 10017).')
-    );
-    const setAutoTrade = vi.spyOn(mt5Bridge, 'setAutoTrade').mockResolvedValue();
-    const signal = {
-      direction: 'BUY' as const,
-      entry: 2000,
-      sl: 1990,
-      tp: 2032,
-      score: 75,
-      scoringPolicyVersion: 3,
-      strategy: 'Trend Pullback' as const,
-      timeframe: 'M5' as const,
-      timestamp: new Date().toISOString(),
-      expiryTimestamp: Date.now() + 60_000,
-    };
+    const sendTrade = vi.spyOn(mt5Bridge, 'sendTrade').mockResolvedValue({
+      ticket: 124,
+      positionTicket: 0,
+      price: 0,
+      filledVolume: 0,
+      partial: false,
+      pending: true,
+    });
+    const recordTrade = vi.spyOn(tradeJournal, 'recordTradeTaken');
+    const recordPendingSignal = vi.spyOn(engine, 'recordPendingSignal');
+    const recordExecutedSignal = vi.spyOn(engine, 'recordExecutedSignal');
+    const candidate = precisionAnalysis('PULLBACK_LIMIT');
+    engine.scannerAnalyses = [candidate];
     vi.spyOn(engine, 'getMarketSnapshot').mockReturnValue({
       brokerMarketData: true,
       zones: [],
-      signals: [signal],
-      signal,
+      signals: [candidate.signal],
+      signal: candidate.signal,
     } as any);
 
     await engine.evaluateAutoExecution();
-    await Promise.resolve();
 
-    expect(engine.autoTrade).toBe(false);
-    expect(setAutoTrade).toHaveBeenCalledWith(false);
-    await engine.evaluateAutoExecution();
+    expect(sendTrade).toHaveBeenCalledWith(expect.objectContaining({
+      orderType: 'LIMIT',
+      limitPrice: 1998,
+    }));
+    expect(recordTrade).not.toHaveBeenCalled();
+    expect(recordPendingSignal).toHaveBeenCalledWith(
+      candidate.signal,
+      124,
+      expect.any(Number),
+      'XAUUSD',
+      expect.any(String)
+    );
+    expect(recordExecutedSignal).not.toHaveBeenCalled();
     expect(sendTrade).toHaveBeenCalledTimes(1);
   });
 
@@ -738,7 +778,7 @@ describe('TradingEngine Store Architecture', () => {
     expect(engine.getEntryBlockReason('BUY', null)).toBe('Direction cooldown is active.');
   });
 
-  it('allows high-confluence signal fallback override when daily limit is reached', () => {
+  it('keeps the daily trade limit strict regardless of signal score', () => {
     engine.account.balance = 1000;
     engine.account.equity = 1000;
     engine.activeSymbol = 'XAUUSD';
@@ -778,11 +818,8 @@ describe('TradingEngine Store Architecture', () => {
     };
 
     // Low score should be blocked by daily limit
-    expect(engine.getEntryBlockReason('BUY', lowScoreSignal)).toContain('DAILY_TRADE_LIMIT_REACHED');
-
-    // High score with allowHighConfluenceOverride should bypass daily limit
-    engine.allowHighConfluenceOverride = true;
-    expect(engine.getEntryBlockReason('BUY', highScoreSignal)).toBeNull();
+    expect(engine.getEntryBlockReason('BUY', lowScoreSignal, Date.now(), true)).toContain('DAILY_TRADE_LIMIT_REACHED');
+    expect(engine.getEntryBlockReason('BUY', highScoreSignal, Date.now(), true)).toContain('DAILY_TRADE_LIMIT_REACHED');
   });
 
   it('auto-selects the best scenario when enabled', () => {
@@ -1009,7 +1046,7 @@ describe('TradingEngine Store Architecture', () => {
     expect(pos?.trailLocked).toBe(true);
   });
 
-  it('validates Asian consolidation suppression and high-profit out-of-session exceptions', () => {
+  it('does not allow a high score to bypass Asian consolidation suppression', () => {
     // Reset closed trades so daily trade limit is clear
     engine.account.balance = 1000;
     engine.account.equity = 1000;
@@ -1037,7 +1074,7 @@ describe('TradingEngine Store Architecture', () => {
     const reason = engine.getEntryBlockReason('BUY', lowSignal, asianDate.getTime());
     expect(reason).toContain('ASIAN_CONSOLIDATION_SUPPRESSED');
 
-    // High-profit exceptional signal (Score >= 6.5 or isOutOfSessionException) authorized
+    // A high score is not an exception to the automated low-liquidity session gate.
     const highProfitSignal: any = {
       direction: 'BUY',
       timeframe: 'M5',
@@ -1052,10 +1089,10 @@ describe('TradingEngine Store Architecture', () => {
     };
 
     const allowedReason = engine.getEntryBlockReason('BUY', highProfitSignal, asianDate.getTime());
-    expect(allowedReason).toBeNull();
+    expect(allowedReason).toContain('ASIAN_CONSOLIDATION_SUPPRESSED');
   });
 
-  it('decouples execution gates and allows profitable trades during direction cooldown', () => {
+  it('does not let score alone bypass scanner precision requirements or direction cooldown', () => {
     engine.account.balance = 5000;
     engine.account.equity = 5000;
     engine.activeSymbol = 'XAUUSD';
@@ -1073,7 +1110,7 @@ describe('TradingEngine Store Architecture', () => {
     const emptyCheck = engine.getEntryBlockReason('BUY', null, now);
     expect(emptyCheck).toBe('Direction cooldown is active.');
 
-    // With a valid profitable signal (RR >= 1.5 with SMC confluence), smart gate decouples and allows entry
+    // Score/RR alone cannot substitute for a scanner-confirmed precision setup.
     const profitableSignal: any = {
       direction: 'BUY',
       timeframe: 'M5',
@@ -1087,6 +1124,6 @@ describe('TradingEngine Store Architecture', () => {
     };
 
     const smartResult = engine.getEntryBlockReason('BUY', profitableSignal, now);
-    expect(smartResult).toBeNull();
+    expect(smartResult).toBe('TRADE_REJECTED: SCANNER_SIGNAL_UNAVAILABLE');
   });
 });

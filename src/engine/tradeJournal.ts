@@ -242,6 +242,23 @@ export function recordJournalSignal(
   return fullRecord;
 }
 
+export function reconcileFilledJournalSignals(positionTickets: number[]): void {
+  const filledTickets = new Set(positionTickets);
+  const signals = readStoredJournalSignals();
+  let changed = false;
+  const reconciled = signals.map((signal) => {
+    if (signal.status !== 'PENDING' || signal.ticket === undefined || !filledTickets.has(signal.ticket)) {
+      return signal;
+    }
+    changed = true;
+    return { ...signal, status: 'EXECUTED' as const };
+  });
+  if (changed) {
+    persistJournalSignals(reconciled);
+    notifyJournalChanged();
+  }
+}
+
 export function readSignalValidations(): SignalValidationRecord[] {
   try {
     const stored = localStorage.getItem(scopedKey(SIGNAL_VALIDATION_STORAGE_KEY));

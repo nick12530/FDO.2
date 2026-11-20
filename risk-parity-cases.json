@@ -1,0 +1,74 @@
+[
+  {
+    "name": "micro-floor-within-both-caps",
+    "equity": 332,
+    "riskBudget": 1.66,
+    "riskPerLot": 237,
+    "volumeMin": 0.01,
+    "volumeStep": 0.01,
+    "volumeMax": 1,
+    "maxMicroFloorRisk": 15,
+    "maxMicroFloorRiskPercent": 3.5,
+    "expectedVolume": 0.01
+  },
+  {
+    "name": "micro-floor-exceeds-dollar-cap-only",
+    "equity": 1000,
+    "riskBudget": 1,
+    "riskPerLot": 1600,
+    "volumeMin": 0.01,
+    "volumeStep": 0.01,
+    "volumeMax": 1,
+    "maxMicroFloorRisk": 15,
+    "maxMicroFloorRiskPercent": 3.5,
+    "expectedVolume": null
+  },
+  {
+    "name": "micro-floor-exceeds-equity-cap-only",
+    "equity": 100,
+    "riskBudget": 1,
+    "riskPerLot": 400,
+    "volumeMin": 0.01,
+    "volumeStep": 0.01,
+    "volumeMax": 1,
+    "maxMicroFloorRisk": 15,
+    "maxMicroFloorRiskPercent": 3.5,
+    "expectedVolume": null
+  },
+  {
+    "name": "micro-floor-at-equity-cap",
+    "equity": 100,
+    "riskBudget": 1,
+    "riskPerLot": 350,
+    "volumeMin": 0.01,
+    "volumeStep": 0.01,
+    "volumeMax": 1,
+    "maxMicroFloorRisk": 15,
+    "maxMicroFloorRiskPercent": 3.5,
+    "expectedVolume": 0.01
+  },
+  {
+    "name": "broker-step-rounds-down",
+    "equity": 100,
+    "riskBudget": 0.97,
+    "riskPerLot": 10,
+    "volumeMin": 0.01,
+    "volumeStep": 0.01,
+    "volumeMax": 1,
+    "maxMicroFloorRisk": 15,
+    "maxMicroFloorRiskPercent": 3.5,
+    "expectedVolume": 0.09
+  },
+  {
+    "name": "broker-maximum-caps-volume",
+    "equity": 100,
+    "riskBudget": 100,
+    "riskPerLot": 1,
+    "volumeMin": 0.01,
+    "volumeStep": 0.01,
+    "volumeMax": 2,
+    "maxMicroFloorRisk": 15,
+    "maxMicroFloorRiskPercent": 3.5,
+    "expectedVolume": 2
+  }
+]

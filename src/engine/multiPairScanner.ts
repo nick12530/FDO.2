@@ -23,6 +23,7 @@ import type {
   TradeDirection,
   Zone,
   VolumeMetrics,
+  SetupLifecycleStage,
 } from '../types/smc';
 import { calculateATR, detectFVGs, detectOrderBlocks, MarketStructureEngine } from './smcCore';
 import { INSTRUMENTS, SupportedSymbol, getInstrumentConfig } from './instrumentConfig';
@@ -134,11 +135,16 @@ export interface PairAnalysis {
   estimatedRiskUsd: number | null;
   symbolSpec?: SymbolTradingSpec;
   rank: number;
+  spreadAdjustedRiskRewardRatio?: number;
+  entryCandidates?: PairAnalysis[];
+  setupLifecycleStage?: SetupLifecycleStage;
+  executionTimeframe?: Signal['timeframe'];
 }
 
 export interface InstrumentAnalysisContext {
   nowMs?: number;
   mode?: 'live' | 'replay';
+  executionTimeframe?: Signal['timeframe'];
   historicalEvents?: EconomicEvent[] | null;
   sendAlerts?: boolean;
   skipAccountSizing?: boolean;
@@ -147,7 +153,8 @@ export interface InstrumentAnalysisContext {
 export type PrecisionEntryCandidate = Pick<
   PairAnalysis,
   'symbol' | 'price' | 'bid' | 'ask' | 'atr' | 'spreadAcceptable' | 'confluenceScore' | 'scoreBreakdown' |
-  'riskRewardRatio' | 'expiryTimestamp' | 'status' | 'signal'
+  'riskRewardRatio' | 'spreadAdjustedRiskRewardRatio' | 'expiryTimestamp' | 'status' | 'signal' |
+  'setupLifecycleStage'
 >;
 
 export function hasDirectionalMovement(
@@ -164,31 +171,66 @@ export function hasDirectionalMovement(
   return direction === 'BUY' ? displacement >= threshold : displacement <= -threshold;
 }
 
+function hasDirectionalExecutionCandle(candles: Candle[], atr: number, direction: TradeDirection): boolean {
+  const current = candles.at(-1);
+  const previous = candles.at(-2);
+  if (!current || !previous || !Number.isFinite(atr) || atr <= 0) return false;
+  const range = current.high - current.low;
+  const body = Math.abs(current.close - current.open);
+  if (range <= 0 || body < atr * 0.25) return false;
+  return direction === 'BUY'
+    ? current.close > current.open && current.close >= previous.high && current.close >= current.low + range * 0.7
+    : current.close < current.open && current.close <= previous.low && current.close <= current.high - range * 0.7;
+}
+
 export function isPrecisionEntryReady(analysis: PrecisionEntryCandidate, now = Date.now()): boolean {
-  const signal = analysis.signal;
+  if (!isPrecisionSetupReady(analysis, now)) return false;
   const executionPrice = getPrecisionEntryPrice(analysis);
   const tolerance = getPrecisionEntryTolerance(analysis);
+  const optimalTradeEntry = analysis.signal?.optimalTradeEntry;
+  if (executionPrice === null || tolerance === null || !optimalTradeEntry) return false;
+  return Math.abs(executionPrice - optimalTradeEntry) <= tolerance;
+}
+
+export function isPrecisionSetupReady(analysis: PrecisionEntryCandidate, now = Date.now()): boolean {
+  const signal = analysis.signal;
   if (
     !signal ||
-    executionPrice === null ||
-    tolerance === null ||
     analysis.status !== 'READY' ||
     !analysis.spreadAcceptable ||
     analysis.confluenceScore < 88 ||
     signal.sniperGrade !== 'A+' ||
     !signal.isSniper ||
-    analysis.riskRewardRatio < getInstrumentConfig(analysis.symbol).minRR ||
+    (analysis.spreadAdjustedRiskRewardRatio ?? analysis.riskRewardRatio) < getInstrumentConfig(analysis.symbol).minRR ||
     !analysis.expiryTimestamp ||
     analysis.expiryTimestamp <= now ||
-    !signal.optimalTradeEntry
+    !signal.optimalTradeEntry ||
+    analysis.setupLifecycleStage !== 'CONFIRMED'
   ) {
     return false;
   }
 
-  return (
-    hasPrecisionEntryConfirmation(analysis) &&
-    Math.abs(executionPrice - signal.optimalTradeEntry) <= tolerance
-  );
+  return hasPrecisionEntryConfirmation(analysis);
+}
+
+export function isPrecisionExecutionReady(
+  analysis: PrecisionEntryCandidate,
+  mode: 'MARKET' | 'PULLBACK_LIMIT' = 'MARKET',
+  now = Date.now()
+): boolean {
+  if (isPrecisionEntryReady(analysis, now)) return true;
+  const signal = analysis.signal;
+  if (
+    !signal ||
+    (signal.executionMode !== 'PULLBACK_LIMIT' && mode !== 'PULLBACK_LIMIT') ||
+    !isPrecisionSetupReady(analysis, now)
+  ) {
+    return false;
+  }
+  const limitPrice = signal.optimalTradeEntry;
+  return signal.direction === 'BUY'
+    ? Number.isFinite(limitPrice) && (limitPrice as number) < analysis.ask && (limitPrice as number) > signal.sl
+    : Number.isFinite(limitPrice) && (limitPrice as number) > analysis.bid && (limitPrice as number) < signal.sl;
 }
 
 export function isPrecisionEntryImminent(analysis: PrecisionEntryCandidate, now = Date.now()): boolean {
@@ -204,10 +246,11 @@ export function isPrecisionEntryImminent(analysis: PrecisionEntryCandidate, now 
     analysis.confluenceScore < 88 ||
     signal.sniperGrade !== 'A+' ||
     !signal.isSniper ||
-    analysis.riskRewardRatio < getInstrumentConfig(analysis.symbol).minRR ||
+    (analysis.spreadAdjustedRiskRewardRatio ?? analysis.riskRewardRatio) < getInstrumentConfig(analysis.symbol).minRR ||
     !analysis.expiryTimestamp ||
     analysis.expiryTimestamp <= now ||
     !signal.optimalTradeEntry ||
+    analysis.setupLifecycleStage !== 'CONFIRMED' ||
     !hasPrecisionEntryConfirmation(analysis)
   ) {
     return false;
@@ -324,6 +367,45 @@ function detectMultiBarSweep(candles: Candle[], lookbackBars: number = 3): 'high
     if (sweepCandle.low < lowest && latest.close > lowest && (offset === 0 || latest.close > latest.open)) {
       return 'low';
     }
+  }
+  return null;
+}
+
+function findRecentSweepEvent(
+  candles: Candle[],
+  lookbackBars: number = 12
+): { kind: 'high' | 'low'; bar: number } | null {
+  if (candles.length < 12) return null;
+  const firstBar = Math.max(10, candles.length - lookbackBars);
+  let latestSweep: { kind: 'high' | 'low'; bar: number } | null = null;
+  for (let bar = firstBar; bar < candles.length; bar += 1) {
+    const candle = candles[bar];
+    const prior = candles.slice(Math.max(0, bar - 30), bar);
+    if (prior.length < 5) continue;
+    const highest = Math.max(...prior.map((item) => item.high));
+    const lowest = Math.min(...prior.map((item) => item.low));
+    if (candle.high > highest && candle.close < highest) latestSweep = { kind: 'high', bar };
+    else if (candle.low < lowest && candle.close > lowest) latestSweep = { kind: 'low', bar };
+  }
+  return latestSweep;
+}
+
+function findDirectionalDisplacementBar(
+  candles: Candle[],
+  atrValues: number[],
+  afterBar: number,
+  direction: TradeDirection
+): number | null {
+  for (let bar = afterBar + 1; bar < candles.length; bar += 1) {
+    const candle = candles[bar];
+    const previous = candles[bar - 1];
+    const atr = atrValues[bar];
+    if (!Number.isFinite(atr) || atr <= 0) continue;
+    const body = Math.abs(candle.close - candle.open);
+    const aligned = direction === 'BUY'
+      ? candle.close > candle.open && candle.close > previous.high
+      : candle.close < candle.open && candle.close < previous.low;
+    if (aligned && body >= atr * 0.6) return bar;
   }
   return null;
 }
@@ -468,6 +550,42 @@ export function calculateSmallAccountPositionSize(
   };
 }
 
+export function analyzeInstrumentCandidates(
+  symbol: SupportedSymbol,
+  candlesM1: Candle[],
+  candlesM5: Candle[],
+  candlesM15: Candle[],
+  candlesH1: Candle[],
+  liveBid: number,
+  liveAsk: number,
+  spreadPoints: number,
+  equity: number,
+  riskPct: number,
+  openPositions: Position[],
+  economicEvents: EconomicEvent[] | null = null,
+  symbolSpec?: SymbolTradingSpec | null,
+  context: InstrumentAnalysisContext = {}
+): PairAnalysis[] {
+  return (['M1', 'M5', 'M15'] as const).map((executionTimeframe) =>
+    analyzeInstrument(
+      symbol,
+      candlesM1,
+      candlesM5,
+      candlesM15,
+      candlesH1,
+      liveBid,
+      liveAsk,
+      spreadPoints,
+      equity,
+      riskPct,
+      openPositions,
+      economicEvents,
+      symbolSpec,
+      { ...context, executionTimeframe, sendAlerts: false }
+    )
+  );
+}
+
 /**
  * Scans and performs end-to-end multi-pair SMC confluence analysis on an instrument.
  */
@@ -518,6 +636,7 @@ export function analyzeInstrument(
 
   const volatility: 'low' | 'normal' | 'high' =
     atr > config.pipSize * 25 ? 'high' : atr < config.pipSize * 8 ? 'low' : 'normal';
+  const atrM1 = calculateATR(candlesM1, config.atrPeriod).at(-1) ?? Number.NaN;
   const atrM5 = calculateATR(candlesM5, config.atrPeriod).at(-1) ?? Number.NaN;
 
   // 3. Liquidity & Zones
@@ -551,7 +670,6 @@ export function analyzeInstrument(
   // 7. Structural events
   const lastBOS = msM15.events.filter((e) => e.kind === 'BOS').slice(-1)[0] || null;
   const lastCHoCH = msM15.events.filter((e) => e.kind === 'CHoCH').slice(-1)[0] || null;
-  const lastStructureEvent = msM15.events.at(-1) || null;
 
   // 8. CONFLUENCE SCORING (0 to 100)
   let scoreHtf = 0;
@@ -585,56 +703,154 @@ export function analyzeInstrument(
     scoreHtf = 10;
   }
 
+  const isM15Setup =
+    ((tentativeBias === 'BUY' && m15Trend === 'bullish') ||
+      (tentativeBias === 'SELL' && m15Trend === 'bearish')) &&
+    h1Trend === m15Trend;
+  const lastM1Event = msM1.events.at(-1);
+  const m1EventAge = lastM1Event ? Math.max(0, candlesM1.length - 1 - lastM1Event.bar) : 999;
+  const isM1ScalpSetup =
+    !isM15Setup &&
+    ((tentativeBias === 'BUY' && m1Trend === 'bullish') ||
+      (tentativeBias === 'SELL' && m1Trend === 'bearish')) &&
+    m1EventAge <= 6 &&
+    spreadAcceptable &&
+    spreadPoints <= config.maxSpreadPoints * 0.75;
+  const signalTimeframe: Signal['timeframe'] =
+    context.executionTimeframe ?? (isM15Setup ? 'M15' : isM1ScalpSetup ? 'M1' : 'M5');
+  const executionCandles =
+    signalTimeframe === 'M1' ? candlesM1 : signalTimeframe === 'M5' ? candlesM5 : candlesM15;
+  const executionStructure =
+    signalTimeframe === 'M1' ? msM1 : signalTimeframe === 'M5' ? msM5 : msM15;
+  const executionTrend =
+    signalTimeframe === 'M1' ? m1Trend : signalTimeframe === 'M5' ? m5Trend : m15Trend;
+  const execAtr =
+    signalTimeframe === 'M1' && Number.isFinite(atrM1) && atrM1 > 0
+      ? atrM1
+      : signalTimeframe === 'M5' && Number.isFinite(atrM5) && atrM5 > 0
+        ? atrM5
+        : atr;
+  const executionAtrValues = calculateATR(executionCandles, config.atrPeriod);
+  const executionObs = detectOrderBlocks(executionCandles, executionAtrValues)
+    .filter((zone) => !zone.filled && zone.born >= executionCandles.length - 20)
+    .slice(-6);
+  const executionFvgs = detectFVGs(executionCandles, executionAtrValues)
+    .filter((zone) => !zone.filled && zone.born >= executionCandles.length - 20)
+    .slice(-6);
+  const executionLiquidity = findLiquidityLevels(executionCandles, config.pipSize);
+  const sweepEvent = findRecentSweepEvent(executionCandles);
+  const alignedSweep = sweepEvent &&
+    ((tentativeBias === 'BUY' && sweepEvent.kind === 'low') ||
+      (tentativeBias === 'SELL' && sweepEvent.kind === 'high'))
+    ? sweepEvent
+    : null;
+  let setupLifecycleStage: SetupLifecycleStage = alignedSweep ? 'SWEEP' : 'NO_SWEEP';
+  const displacementBar = alignedSweep
+    ? findDirectionalDisplacementBar(
+        executionCandles,
+        executionAtrValues,
+        alignedSweep.bar,
+        tentativeBias === 'BUY' ? 'BUY' : 'SELL'
+      )
+    : null;
+  if (displacementBar !== null) setupLifecycleStage = 'DISPLACEMENT';
+  const structureEvent = displacementBar === null
+    ? null
+    : executionStructure.events.find((event) =>
+        event.bar >= displacementBar &&
+        ((tentativeBias === 'BUY' && event.direction === 'bullish') ||
+          (tentativeBias === 'SELL' && event.direction === 'bearish'))
+      ) ?? null;
+  if (structureEvent) setupLifecycleStage = 'STRUCTURE_BREAK';
+  const directionalZones = [...executionFvgs, ...executionObs].filter((zone) =>
+    tentativeBias === 'BUY' ? zone.bullish : !zone.bullish
+  );
+  const poiRetest = structureEvent
+    ? directionalZones
+        .filter((zone) =>
+          zone.born >= structureEvent.bar - 1 &&
+          zone.born < executionCandles.length - 1 &&
+          !zone.filled
+        )
+        .map((zone) => ({
+          zone,
+          retestBar: executionCandles.findIndex((candle, index) =>
+            index > zone.born &&
+            index > structureEvent.bar &&
+            index < executionCandles.length - 1 &&
+            candle.low <= zone.top &&
+            candle.high >= zone.bottom
+          ),
+        }))
+        .filter(({ zone, retestBar }) =>
+          retestBar > structureEvent.bar &&
+          price >= zone.bottom - execAtr * 0.15 &&
+          price <= zone.top + execAtr * 0.15
+        )
+        .sort((a, b) => b.zone.born - a.zone.born)[0] ?? null
+    : null;
+  if (poiRetest) setupLifecycleStage = 'POI_RETEST';
+  const hasExecutionConfirmation = Boolean(
+    poiRetest &&
+    executionCandles.length - 1 > poiRetest.retestBar &&
+    hasDirectionalExecutionCandle(
+      executionCandles,
+      execAtr,
+      tentativeBias === 'BUY' ? 'BUY' : 'SELL'
+    )
+  );
+  if (hasExecutionConfirmation) setupLifecycleStage = 'CONFIRMED';
+
   const hasMovement = tentativeBias !== 'WAITING' && hasDirectionalMovement(
-    candlesM5,
-    atrM5,
+    executionCandles,
+    execAtr,
     spreadPoints * config.pointSize,
     tentativeBias
   );
 
   // +20 Market structure confirmation
-  if (tentativeBias === 'BUY' && (m5Trend === 'bullish' || m1Trend === 'bullish')) {
+  if (
+    (tentativeBias === 'BUY' && executionTrend === 'bullish') ||
+    (tentativeBias === 'SELL' && executionTrend === 'bearish')
+  ) {
     scoreStructure = 16;
-  } else if (tentativeBias === 'SELL' && (m5Trend === 'bearish' || m1Trend === 'bearish')) {
-    scoreStructure = 16;
-  } else if (m5Trend !== 'ranging') {
+  } else if (executionTrend !== 'ranging') {
     scoreStructure = 8;
   }
 
-  // +15 Liquidity sweep (check both M15 and M5 3-bar sweep windows so multi-bar SFPs are caught)
-  const m15MultiSweep = detectMultiBarSweep(candlesM15, 3);
-  const m5MultiSweep = detectMultiBarSweep(candlesM5, 3);
-  const effectiveSweep = liquidity.recentSweep ?? m15MultiSweep ?? m5MultiSweep;
+  // Evaluate liquidity independently on each candidate's execution timeframe.
+  const executionMultiSweep = detectMultiBarSweep(executionCandles, 3);
+  const effectiveSweep = alignedSweep?.kind ?? executionLiquidity.recentSweep ?? executionMultiSweep;
 
   if (tentativeBias === 'BUY' && effectiveSweep === 'low') {
     scoreLiquidity = 15;
   } else if (tentativeBias === 'SELL' && effectiveSweep === 'high') {
     scoreLiquidity = 15;
   } else if (
-    (tentativeBias === 'BUY' && liquidity.equalLows.length > 0) ||
-    (tentativeBias === 'SELL' && liquidity.equalHighs.length > 0)
+    (tentativeBias === 'BUY' && executionLiquidity.equalLows.length > 0) ||
+    (tentativeBias === 'SELL' && executionLiquidity.equalHighs.length > 0)
   ) {
     scoreLiquidity = 5;
   }
 
   // BOS/CHoCH is related to the structure score, so its independent contribution is capped at 5.
-  const eventAgeBars = lastStructureEvent
-    ? Math.max(0, candlesM15.length - 1 - lastStructureEvent.bar)
+  const lastExecutionEvent = executionStructure.events.at(-1) || null;
+  const eventAgeBars = lastExecutionEvent
+    ? Math.max(0, executionCandles.length - 1 - lastExecutionEvent.bar)
     : Number.POSITIVE_INFINITY;
   const eventMatchesBias =
-    (tentativeBias === 'BUY' && lastStructureEvent?.direction === 'bullish') ||
-    (tentativeBias === 'SELL' && lastStructureEvent?.direction === 'bearish');
+    (tentativeBias === 'BUY' && lastExecutionEvent?.direction === 'bullish') ||
+    (tentativeBias === 'SELL' && lastExecutionEvent?.direction === 'bearish');
   if (eventMatchesBias && eventAgeBars < 20) {
     scoreBosChoch = Math.round(5 * (1 - eventAgeBars / 20));
   }
 
   // +10 Order Block / FVG reaction in discount/premium
-  const isRelevantZone = (zone: Zone) =>
-    price >= zone.bottom - 0.25 * atr && price <= zone.top + 0.25 * atr;
-  const matchedObs = obs.filter(
+  const isRelevantZone = (zone: Zone) => price >= zone.bottom && price <= zone.top;
+  const matchedObs = executionObs.filter(
     (ob) => (tentativeBias === 'BUY' ? ob.bullish : !ob.bullish) && isRelevantZone(ob)
   );
-  const matchedFvgs = fvgs.filter(
+  const matchedFvgs = executionFvgs.filter(
     (fvg) => (tentativeBias === 'BUY' ? fvg.bullish : !fvg.bullish) && isRelevantZone(fvg)
   );
   const hasMatchingOb = matchedObs.length > 0;
@@ -650,7 +866,12 @@ export function analyzeInstrument(
   }
 
   // Momentum overlaps the structure/candle evidence; retain a smaller independent contribution.
-  if (hasMovement) scoreMomentum = 8;
+  if (
+    hasMovement &&
+    hasDirectionalExecutionCandle(executionCandles, execAtr, tentativeBias === 'BUY' ? 'BUY' : 'SELL')
+  ) {
+    scoreMomentum = 8;
+  }
 
   // +5 Session confirmation
   if (isPreferredSession) {
@@ -666,7 +887,7 @@ export function analyzeInstrument(
 
   // +5 heuristic candle-pattern confirmation; it is not a win-probability estimate.
   const candleAnalysis = analyzeCandlestickPatterns(
-    candlesM5.length >= 4 ? candlesM5 : candlesM15,
+    executionCandles.length >= 4 ? executionCandles : candlesM15,
     config.pipSize,
     symbol
   );
@@ -682,7 +903,7 @@ export function analyzeInstrument(
   }
 
   // 8b. Broker tick-volume proxy; it does not identify participant type or trade direction.
-  const volumeCandles = candlesM5.length >= 6 ? candlesM5 : candlesM15;
+  const volumeCandles = executionCandles.length >= 6 ? executionCandles : candlesM15;
   const volMetrics = calculateRVOL(volumeCandles, 20, config.digits);
   let scoreVolume = 0;
   if (volMetrics.available) {
@@ -716,30 +937,7 @@ export function analyzeInstrument(
     scoreMomentum + scoreSession + scoreSpread + scoreCandle + scoreVolume + scoreMacro;
   const confluenceScore = normalizeRawConfluenceScore(rawConfluenceScore, SCANNER_RAW_SCORE_MAX);
 
-  // Determine active execution timeframe (M15 swing, M1 fast scalp on tight spreads, or M5 baseline)
-  const isM15Setup =
-    ((tentativeBias === 'BUY' && m15Trend === 'bullish') ||
-      (tentativeBias === 'SELL' && m15Trend === 'bearish')) &&
-    scoreHtf >= 15;
-  const lastM1Event = msM1.events.at(-1);
-  const m1EventAge = lastM1Event ? Math.max(0, candlesM1.length - 1 - lastM1Event.bar) : 999;
-  const isM1ScalpSetup =
-    !isM15Setup &&
-    ((tentativeBias === 'BUY' && m1Trend === 'bullish') ||
-      (tentativeBias === 'SELL' && m1Trend === 'bearish')) &&
-    m1EventAge <= 6 &&
-    spreadAcceptable &&
-    spreadPoints <= config.maxSpreadPoints * 0.75;
-  const signalTimeframe: 'M1' | 'M5' | 'M15' = isM15Setup ? 'M15' : isM1ScalpSetup ? 'M1' : 'M5';
-
   // 9. Stop Loss & Multi-Target Take Profit (Timeframe-calibrated for M1/M5 scalping & M15 swings)
-  const atrM1 = calculateATR(candlesM1, config.atrPeriod).at(-1);
-  const execAtr =
-    signalTimeframe === 'M1' && Number.isFinite(atrM1) && (atrM1 as number) > 0
-      ? (atrM1 as number)
-      : signalTimeframe === 'M5' && Number.isFinite(atrM5) && atrM5 > 0
-      ? atrM5
-      : atr;
   const slBuffer = execAtr * 0.3;
   const slFloorPips = signalTimeframe === 'M1' ? 4 : 5;
   const mult1 = signalTimeframe === 'M1' ? 1.2 : signalTimeframe === 'M5' ? 1.5 : 1.8;
@@ -753,30 +951,59 @@ export function analyzeInstrument(
   let suggestedTP3 = price;
 
   if (tentativeBias === 'BUY') {
-    const anchorMs = signalTimeframe === 'M1' ? msM1 : msM5;
+    const anchorMs = executionStructure;
     const swingLowPrice = anchorMs.lastSwingLow?.price || dr.low;
     suggestedSL = Number(Math.min(price - execAtr * config.atrSlMultiplier, swingLowPrice - slBuffer).toFixed(config.digits));
     const slDist = Math.max(config.pipSize * slFloorPips, price - suggestedSL);
-    suggestedTP1 = Number((price + slDist * mult1).toFixed(config.digits));
-    suggestedTP2 = Number((price + slDist * mult2).toFixed(config.digits));
-    suggestedTP3 = Number((price + slDist * mult3).toFixed(config.digits));
-    suggestedTP = suggestedTP2;
+    const fallbackTargets = [
+      price + slDist * mult1,
+      price + slDist * mult2,
+      price + slDist * mult3,
+    ];
+    const structuralTargets = Array.from(new Set([
+      anchorMs.lastSwingHigh?.price,
+      ...executionLiquidity.equalHighs,
+      executionLiquidity.buySideLiquidity,
+      dr.high,
+    ].filter((target): target is number =>
+        typeof target === 'number' && Number.isFinite(target) && target > price + config.pointSize
+    ))).sort((a, b) => a - b);
+    suggestedTP1 = Number((structuralTargets[0] ?? fallbackTargets[0]).toFixed(config.digits));
+    suggestedTP2 = Number((structuralTargets[1] ?? structuralTargets[0] ?? fallbackTargets[1]).toFixed(config.digits));
+    suggestedTP3 = Number((structuralTargets[2] ?? structuralTargets[1] ?? fallbackTargets[2]).toFixed(config.digits));
+    suggestedTP = Number((structuralTargets[0] ?? fallbackTargets[1]).toFixed(config.digits));
   } else if (tentativeBias === 'SELL') {
-    const anchorMs = signalTimeframe === 'M1' ? msM1 : msM5;
+    const anchorMs = executionStructure;
     const swingHighPrice = anchorMs.lastSwingHigh?.price || dr.high;
     suggestedSL = Number(Math.max(price + execAtr * config.atrSlMultiplier, swingHighPrice + slBuffer).toFixed(config.digits));
     const slDist = Math.max(config.pipSize * slFloorPips, suggestedSL - price);
-    suggestedTP1 = Number((price - slDist * mult1).toFixed(config.digits));
-    suggestedTP2 = Number((price - slDist * mult2).toFixed(config.digits));
-    suggestedTP3 = Number((price - slDist * mult3).toFixed(config.digits));
-    suggestedTP = suggestedTP2;
+    const fallbackTargets = [
+      price - slDist * mult1,
+      price - slDist * mult2,
+      price - slDist * mult3,
+    ];
+    const structuralTargets = Array.from(new Set([
+      anchorMs.lastSwingLow?.price,
+      ...executionLiquidity.equalLows,
+      executionLiquidity.sellSideLiquidity,
+      dr.low,
+    ].filter((target): target is number =>
+        typeof target === 'number' && Number.isFinite(target) && target < price - config.pointSize
+    ))).sort((a, b) => b - a);
+    suggestedTP1 = Number((structuralTargets[0] ?? fallbackTargets[0]).toFixed(config.digits));
+    suggestedTP2 = Number((structuralTargets[1] ?? structuralTargets[0] ?? fallbackTargets[1]).toFixed(config.digits));
+    suggestedTP3 = Number((structuralTargets[2] ?? structuralTargets[1] ?? fallbackTargets[2]).toFixed(config.digits));
+    suggestedTP = Number((structuralTargets[0] ?? fallbackTargets[1]).toFixed(config.digits));
   }
 
   const executionPrice = tentativeBias === 'BUY' ? liveAsk : tentativeBias === 'SELL' ? liveBid : price;
   const stopDistance = Math.abs(executionPrice - suggestedSL);
   const targetDistance = Math.abs(suggestedTP - executionPrice);
   const riskRewardRatio = Number((targetDistance / Math.max(0.00001, stopDistance)).toFixed(2));
-
+  const spreadCost = spreadPoints * config.pointSize;
+  const spreadAdjustedRiskRewardRatio = Number(
+    (Math.max(0, targetDistance - spreadCost) / Math.max(0.00001, stopDistance + spreadCost)).toFixed(2)
+  );
   const slPips = Number((stopDistance / config.pipSize).toFixed(1));
   const targetPips1 = Number((Math.abs(suggestedTP1 - executionPrice) / config.pipSize).toFixed(1));
   const targetPips2 = Number((Math.abs(suggestedTP2 - executionPrice) / config.pipSize).toFixed(1));
@@ -815,7 +1042,7 @@ export function analyzeInstrument(
     } else if (newsRisk.hasNewsRisk) {
       status = 'BLOCKED';
       rejectionReason = `TRADE_REJECTED: ${newsRisk.reason}`;
-    } else if (!correlationResult.allowed && confluenceScore < 70) {
+    } else if (!correlationResult.allowed) {
       status = 'BLOCKED';
       rejectionReason = correlationResult.reason || 'TRADE_REJECTED: CORRELATION_LIMIT_EXCEEDED';
     } else if (!context.skipAccountSizing && sizingResult.rejectionReason) {
@@ -824,6 +1051,12 @@ export function analyzeInstrument(
     } else {
       status = 'READY';
     }
+  }
+
+  if (status === 'READY' && spreadAdjustedRiskRewardRatio < config.minRR) {
+    status = 'BLOCKED';
+    rejectionReason =
+      `TRADE_REJECTED: SPREAD_ADJUSTED_RR_BELOW_MINIMUM (${spreadAdjustedRiskRewardRatio}:1 < ${config.minRR}:1)`;
   }
 
   // 11. Expiry and POI-anchored OTE
@@ -849,10 +1082,21 @@ export function analyzeInstrument(
   const sniperGrade: 'A+' | 'A' | 'B' = confluenceScore >= 88 ? 'A+' : confluenceScore >= 75 ? 'A' : 'B';
 
   // Anchor Optimal Trade Entry to nearest matching FVG 50% CE or OB proximal edge when within 2 ATR
-  const dirMatchObs = obs.filter((ob) => tentativeBias === 'BUY' ? ob.bullish : !ob.bullish);
-  const dirMatchFvgs = fvgs.filter((fvg) => tentativeBias === 'BUY' ? fvg.bullish : !fvg.bullish);
+  const dirMatchObs = executionObs.filter((ob) => tentativeBias === 'BUY' ? ob.bullish : !ob.bullish);
+  const dirMatchFvgs = executionFvgs.filter((fvg) => tentativeBias === 'BUY' ? fvg.bullish : !fvg.bullish);
   const nearestPoi = [...matchedFvgs, ...matchedObs, ...dirMatchFvgs, ...dirMatchObs]
-    .sort((a, b) => Math.abs((a.top + a.bottom) / 2 - price) - Math.abs((b.top + b.bottom) / 2 - price))[0];
+    .filter((zone) => Math.abs((zone.top + zone.bottom) / 2 - price) <= execAtr * 2)
+    .sort((a, b) => {
+      const aRetested = price >= a.bottom && price <= a.top ? 0 : 1;
+      const bRetested = price >= b.bottom && price <= b.top ? 0 : 1;
+      if (aRetested !== bRetested) return aRetested - bRetested;
+      const aAge = executionCandles.length - 1 - a.born;
+      const bAge = executionCandles.length - 1 - b.born;
+      if (aAge !== bAge) return aAge - bAge;
+      const aMidpointBias = a.kind === 'FVG' ? 0 : 1;
+      const bMidpointBias = b.kind === 'FVG' ? 0 : 1;
+      return aMidpointBias - bMidpointBias;
+    })[0];
   const poiAnchorPrice = nearestPoi
     ? nearestPoi.kind === 'FVG'
       ? (nearestPoi.bottom + nearestPoi.top) / 2
@@ -861,8 +1105,8 @@ export function analyzeInstrument(
         : nearestPoi.bottom
     : null;
 
-  const swingLow = msM5.lastSwingLow?.price || dr.low;
-  const swingHigh = msM5.lastSwingHigh?.price || dr.high;
+  const swingLow = executionStructure.lastSwingLow?.price || dr.low;
+  const swingHigh = executionStructure.lastSwingHigh?.price || dr.high;
   const legSpan = Math.max(config.pipSize * 10, swingHigh - swingLow);
   const oteBuy = swingLow + 0.382 * legSpan;
   const oteSell = swingLow + 0.618 * legSpan;
@@ -874,6 +1118,22 @@ export function analyzeInstrument(
         : oteSell;
   const optimalTradeEntry = Number(rawOptimalTradeEntry.toFixed(config.digits));
   const mitigationType = scoreLiquidity >= 10 ? 'Liquidity Pool Sweep (SFP)' : scoreObFvg >= 5 ? 'Order Block Mitigation' : 'Structural POI Retest';
+  const entryDistance = Math.abs(executionPrice - optimalTradeEntry);
+  const marketEntryTolerance = Math.max(execAtr * 0.15, config.pipSize * 2);
+  const isMarketEntryConfirmed = entryDistance <= marketEntryTolerance;
+  const hasBrokerValidPullback =
+    tentativeBias === 'BUY'
+      ? optimalTradeEntry < executionPrice && optimalTradeEntry > suggestedSL
+      : tentativeBias === 'SELL'
+        ? optimalTradeEntry > executionPrice && optimalTradeEntry < suggestedSL
+        : false;
+  if (status === 'READY' && setupLifecycleStage !== 'CONFIRMED') {
+    status = 'WAITING';
+    rejectionReason = `WAITING: SETUP_LIFECYCLE_${setupLifecycleStage}`;
+  } else if (status === 'READY' && !isMarketEntryConfirmed && !hasBrokerValidPullback) {
+    status = 'WAITING';
+    rejectionReason = 'WAITING: PULLBACK_PRICE_NOT_BROKER_VALID';
+  }
 
   // 12. Create Signal object if ready
   let signalObj: Signal | null = null;
@@ -915,8 +1175,9 @@ export function analyzeInstrument(
       sniperQualityIndex,
       sniperGrade,
       optimalTradeEntry,
-      executionMode: Math.abs(executionPrice - optimalTradeEntry) > execAtr * 0.25 ? 'PULLBACK_LIMIT' : 'MARKET',
+      executionMode: isMarketEntryConfirmed ? 'MARKET' : 'PULLBACK_LIMIT',
       mitigationType,
+      setupLifecycleStage,
       recommendedLot: sizingResult.safeVolume || undefined,
       reasons,
       atr: execAtr,
@@ -947,8 +1208,8 @@ export function analyzeInstrument(
     lastBOS,
     lastCHoCH,
     liquidity,
-    orderBlocks: obs,
-    fvgs,
+    orderBlocks: executionObs,
+    fvgs: executionFvgs,
     dealingRange: dr,
     premiumDiscountPct,
     atr,
@@ -997,6 +1258,9 @@ export function analyzeInstrument(
     sniperGrade,
     optimalTradeEntry,
     riskRewardRatio,
+    spreadAdjustedRiskRewardRatio,
+    setupLifecycleStage,
+    executionTimeframe: signalTimeframe,
     status,
     rejectionReason,
     safeLotSize: sizingResult.safeVolume,
@@ -1057,25 +1321,48 @@ export function analyzeInstrument(
  */
 export function rankOpportunities(analyses: PairAnalysis[]): PairAnalysis[] {
   const sorted = [...analyses].sort((a, b) => {
-    // 1. Ready status first
     if (a.status === 'READY' && b.status !== 'READY') return -1;
     if (b.status === 'READY' && a.status !== 'READY') return 1;
 
-    // 2. Confluence score descending
+    const aPrecisionReady = isPrecisionEntryReady(a);
+    const bPrecisionReady = isPrecisionEntryReady(b);
+    if (aPrecisionReady !== bPrecisionReady) return aPrecisionReady ? -1 : 1;
+
+    const structuralQuality = (item: PairAnalysis) =>
+      item.scoreBreakdown.structureConfirm +
+      item.scoreBreakdown.liquiditySweep +
+      item.scoreBreakdown.bosChoch +
+      item.scoreBreakdown.obFvgReaction;
+    const structuralDifference = structuralQuality(b) - structuralQuality(a);
+    if (structuralDifference !== 0) return structuralDifference;
+
+    const entryDistance = (item: PairAnalysis) =>
+      item.signal?.optimalTradeEntry && item.atr > 0
+        ? Math.abs(item.price - item.signal.optimalTradeEntry) / item.atr
+        : Number.POSITIVE_INFINITY;
+    const entryDistanceDifference = entryDistance(a) - entryDistance(b);
+    if (entryDistanceDifference !== 0) return entryDistanceDifference;
+
+    if (b.spreadAdjustedRiskRewardRatio !== a.spreadAdjustedRiskRewardRatio) {
+      return (b.spreadAdjustedRiskRewardRatio ?? 0) - (a.spreadAdjustedRiskRewardRatio ?? 0);
+    }
+
+    const spreadLoad = (item: PairAnalysis) =>
+      item.atr > 0 ? (item.spreadPoints * getInstrumentConfig(item.symbol).pointSize) / item.atr : Infinity;
+    const spreadLoadDifference = spreadLoad(a) - spreadLoad(b);
+    if (spreadLoadDifference !== 0) return spreadLoadDifference;
+
     if (b.confluenceScore !== a.confluenceScore) {
       return b.confluenceScore - a.confluenceScore;
     }
 
-    // 3. Risk-Reward ratio descending
     if (b.riskRewardRatio !== a.riskRewardRatio) {
       return b.riskRewardRatio - a.riskRewardRatio;
     }
 
-    // 4. Preferred session
     if (a.isPreferredSession && !b.isPreferredSession) return -1;
     if (b.isPreferredSession && !a.isPreferredSession) return 1;
 
-    // 5. Lower spread
     return a.spreadPoints - b.spreadPoints;
   });
 

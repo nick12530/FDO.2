@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { calculateRiskBasedVolume, isAdaptiveMicroFloorAllowed, RISK_CONFIG } from './riskConfig';
+import riskParityCases from '../../risk-parity-cases.json';
 
 const spec = {
   tickSize: 0.01,
@@ -32,10 +33,34 @@ describe('broker risk-based position sizing', () => {
     expect(calculateRiskBasedVolume(89.92, RISK_CONFIG.riskPercentPerTrade, 1, eurUsdSpec)).toBe(0.01);
   });
 
-  it('limits adaptive minimum-lot risk to the configured dollar or equity cap', () => {
+  it('limits adaptive minimum-lot risk to both configured dollar and equity caps', () => {
     expect(isAdaptiveMicroFloorAllowed(332, 2.37)).toBe(true);
+    expect(isAdaptiveMicroFloorAllowed(1_000, 16)).toBe(false);
+    expect(isAdaptiveMicroFloorAllowed(100, 4)).toBe(false);
     expect(isAdaptiveMicroFloorAllowed(100, 15.01)).toBe(false);
     expect(isAdaptiveMicroFloorAllowed(100, 3.5)).toBe(true);
     expect(isAdaptiveMicroFloorAllowed(100, 3.51)).toBe(false);
+  });
+
+  it('matches Python sizing results from shared parity cases', () => {
+    for (const testCase of riskParityCases) {
+      const spec = {
+        tickSize: 1,
+        tickValue: testCase.riskPerLot,
+        contractSize: 1,
+        volumeMin: testCase.volumeMin,
+        volumeMax: testCase.volumeMax,
+        volumeStep: testCase.volumeStep,
+      };
+      expect(
+        calculateRiskBasedVolume(
+          testCase.equity,
+          (testCase.riskBudget / testCase.equity) * 100,
+          1,
+          spec
+        ),
+        testCase.name
+      ).toBe(testCase.expectedVolume);
+    }
   });
 });
